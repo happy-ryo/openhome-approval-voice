@@ -1,0 +1,3 @@
+# approval-voice ability — stdlib only.
+# The pure-logic `approval_voice` package (renderer/schema/poller/bridge) is
+# bundled into this folder at deploy time (see README), not installed via pip.

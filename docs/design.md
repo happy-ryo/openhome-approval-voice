@@ -241,6 +241,101 @@
 
 ---
 
+## M3. 実 OpenHome 接続（実測で確定）
+
+M3 で実 OpenHome API に接続し、M1 で ≈（要検証）としていた点を実測で確定した。
+**凡例更新**: 以下はすべて実 API / 実コード（openhome-dev/abilities の稼働中 ability）で確認済み。
+
+### M3.0 経路の決定（cloud WS 不採用 → (C) DevKit on-device 逐語）
+
+| 経路 | 実測した挙動 | 本件での可否 |
+|------|--------------|--------------|
+| Cloud WebSocket `wss://app.openhome.com/websocket/voice-stream/{KEY}/{AGENT_ID}` | 送信 text を**ユーザ発話(`type:transcribed`)として扱い**、エージェントの LLM が**応答を生成して読み上げる**。本質的に双方向チャネル | ❌ 承認文面が**言い換え**られ取り違えリスク。不採用 |
+| REST API `app.openhome.com`（`X-API-KEY` ヘッダ） | 鍵で認証成功（HTTP 200）。エージェント一覧取得可。ability アップロード可 | 管理用途のみ（逐語読み上げ手段ではない） |
+| **(C) DevKit on-device** Background Ability の `speak()` | `speak()` は**直接 TTS**＝**逐語**読み上げ。LLM を介さない | ✅ **採用**。approval-voice は承認文面の正確さが要 |
+
+> 依頼者判断により (C) を採用。逐語性は `speak()` が直接 TTS する事実から来る（raw_prompt
+> ではない）。専用エージェントは既存 "Dev Guide Ori" と分離し voice 設定を持たせるための器。
+
+### M3.1 OpenHome SDK 表面（実コードで確定）
+
+稼働中の background ability（`openhome-dev/abilities` · `community/alarm-timer/background.py`）
+を一次情報として確認した（本件はコード実行不可のため doc 要約でなく実コードで裏取り）:
+
+```python
+from src.agent.capability import MatchingCapability
+from src.agent.capability_worker import CapabilityWorker
+from src.main import AgentWorker
+
+class XxxWatcher(MatchingCapability):
+    # Do not change following tag of register capability
+    # {{register capability}}
+    def call(self, worker: AgentWorker, background_daemon_mode: bool):
+        self.capability_worker = CapabilityWorker(self.worker)   # ← self.worker（self ではない）
+        self.worker.session_tasks.create(self.watch_loop())
+
+    async def watch_loop(self):
+        while True:
+            ...                                        # ファイル検知
+            await self.capability_worker.send_interrupt_signal()   # speak 前に 1 回だけ
+            await self.capability_worker.speak(text)               # 逐語読み上げ
+            await self.worker.session_tasks.sleep(15.0)            # asyncio.sleep は不可
+```
+
+| 接続点 | M1 表記 | M3 実測 |
+|--------|---------|---------|
+| Ability 雛形 | ✓ | ✓ 確定: `MatchingCapability` 継承 + `# {{register capability}}` マーカー + `call()` + `session_tasks.create()` |
+| background `call()` 署名 | （未記載） | **`call(self, worker, background_daemon_mode: bool)`**（interactive の `call(self, worker)` と異なる） |
+| `CapabilityWorker` 取得 | ≈ | **`CapabilityWorker(self.worker)`**（how-to-build doc の `CapabilityWorker(self)` は誤り） |
+| 通知受け口（polling） | ≈ 要検証1 | ✓ `while True` + `await session_tasks.sleep(秒)`。`asyncio.sleep` 禁止。10–30 秒が標準 |
+| 割り込み | ≈ 要検証3 | ✓ `await send_interrupt_signal()` を **speak の前に 1 回だけ**（ループ内で呼ばない） |
+| 読み上げ | ✓ | ✓ `await speak(text)` = 直接 TTS（逐語） |
+| ファイル協調 | ≈ 要検証2 | ✓ SDK は `read_file/write_file/check_if_file_exists/delete_file`（async, 第2引数 False）。Local Ability は素の `open()` も可（device の Linux パス） |
+
+### M3.2 一方向性（実測で強化）
+
+- 入力取得 API は実 SDK 上 `user_response()` と `run_io_loop()`（"speak してから返答を待つ"）の 2 つ。
+  両方とも禁止集合（§3.1）に既に含まれ、**`tests/test_one_way.py` の AST 走査を
+  `openhome_ability/` にも拡張**して on-device 経路を網羅した。
+- background-abilities doc により、`send_interrupt_signal()` を speak 前に呼ばないと
+  **デーモンの発話がユーザ入力として転写される**。割り込みは一方向担保の構造的ガードも兼ねる。
+- 読み上げに LLM 整形（`text_to_text_response`）は使わない（逐語が要件。要検証4 は「逐語固定」で決着）。
+
+### M3.3 transport の決定（要検証2 の決着・Q2）
+
+**採用: 端末ローカルの固定 JSON ファイル**を bridge が**アトミック書き込み**(temp→`os.replace`)し、
+ability が素の `open()` で**読み取り専用**ポーリング。既読カーソルは**別ファイル**に
+ability 側ローカルで永続（組織へ書き戻さない＝副作用ゼロ, §3.2）。パス/間隔は環境変数で可変。
+
+採用理由（最も単純かつ確実）:
+1. Local Ability の文書化された FS パターン（device パスへの素の `open()`）にそのまま乗る。
+2. ネットワーク/認証が不要（外部 writer=bridge が同一端末に同居）。
+3. `os.replace` のアトミック rename で poller が**半端な書き込みを絶対に読まない**。
+4. 既読カーソル dedup で二重読み上げ・取りこぼしを防止。
+
+> 代替（同一 ability 内で writer/reader が完結する場合）は SDK の `read_file/write_file`
+> が定石。本件は writer が外部 bridge のため、store 解決の曖昧さを避けて素の `open()` を採る。
+
+### M3.4 デプロイ／エージェント作成（実測）
+
+- ability アップロードは REST: `POST app.openhome.com/api/capabilities/add-capability/`
+  （`X-API-KEY`, multipart, **`category=background`**, `zip_file`）。`npx openhome-cli` でも可。
+- **エージェント新規作成の REST エンドポイントは公式 doc に記載なし**（get-all / edit はある）。
+  依頼者は専用エージェントの REST 作成を許可していたが、未文書化エンドポイントへライブ
+  アカウントに当て推量 POST するのは避けるべきと判断し**専用エージェントは未作成**のまま、
+  **Dashboard の Quick Creation** で逐語固定の専用エージェントを作る手順を README に記載した
+  （この逸脱は完了報告で窓口に明記する）。
+
+### M3.5 end-to-end の到達点
+
+コード経路（bridge atomic write → 端末 JSON → ability `open()` poll → dedup → 逐語
+`render_speech` → `send_interrupt_signal()`→`speak()`）は実 SDK 形で実装・整合済み。
+**実機での実音声 1 回**は物理工程（flash/接続/deploy/聴取）が要るため依頼者が手元 DevKit で
+実施（README の手順書に成功条件＝「逐語で聞こえる／再転写されない」を明記）。bridge 入力は
+M1 同様の**概念 notification dict**（public 衛生のため実 org state スキーマは写さない）。
+
+---
+
 ## 付録: 参照
 
 - 社内既存リサーチ「OpenHome × 組織システム × renga 連携検討資料」(2026-05-31)
