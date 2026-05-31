@@ -296,13 +296,56 @@ OpenHome ランタイム経由で、§3 で enable した capability の **backg
 - ⇒ 到達は可能だが **SSH ログイン資格情報（ユーザ名＋鍵/パスワード）は未提供**。
   認証ブルートフォース・既定資格情報の当て推量は**禁止につき試行せず**（要 escalation）。
 
+### 7.5b デプロイ実行ログ（JWT 受領後・実測で確定した packaging 規則）
+JWT（access, exp≈7日）受領後に add-capability を実行し、以下を実測で確定:
+- **認証**: `Authorization: Bearer <JWT>` で capabilities API 全面が通る（categories/get-all/add 全て 200/処理到達）。
+- **category 正値**: `get/categories/` の実値は `skill`/`brain_skill`/**`background_daemon`**（"Runs in the background always"）/`local`（"Runs on DevKit Hardware"）。
+  ⇒ DEPLOY.md 旧 `category=background` は誤り。常駐 watcher は **`category=background_daemon`** が正。
+- **name 規則**: 英字始まり・英数字のみ（ハイフン不可）。`approval-voice`→400。**`approvalvoice`** で通過。
+- **zip レイアウト**: ルート直置きは `main.py file not found` で 400。**ラップフォルダ必須**＝`build_zip.py --root-folder approvalvoice`（`approvalvoice/main.py ...`）。
+- **重複なし**: `get-all-capabilities` = 0 件（本実行で capability は一切作成されていない＝全て 400/未作成）。
+
+### 7.5c ⛔ Ability sandbox がコア設計と非互換（最重要・要設計判断）
+add-capability はアップロード zip を**静的スキャン**し、禁止 import/パターンがあると 400。実測＋公式
+[SDK Reference](https://docs.openhome.com/api-sdk/sdk-reference.md) で確定した禁止事項:
+- **`import sys`**（実測 400: `Forbidden import of module 'sys'` @background.py）
+- **`import os`**（top-level 不可）
+- **top-level `import json`**（register ブロック外で不可）
+- **`signal`**、`redis`/`connection_manager`/`user_config`、`exec()`/`eval()`/`pickle`
+- **raw `open()` 不可** → `capability_worker` のファイルヘルパを使う:
+  `read_file(name, temp)` / `write_file(name, content, temp)` / `check_if_file_exists(name, temp)` / `delete_file()`
+  （ストレージは**パスではなく名前**で扱う。JSON 永続は append 不可＝delete+write）
+
+> ⚠️ 現行 approval-voice は **`background.py`＋`approval_voice/bridge.py`＋`approval_voice/poller.py`** が
+> `os`（path/environ/expanduser/exists/replace）・top-level `json`・raw `open()`・`pathlib.Path`・`sys.path.insert`
+> に**全面依存**。これは sandbox の禁止セットそのもの。⇒ **localized な import 修正では通らず、
+> 「ローカル JSON ファイルを open() で読む」というトランスポート設計の作り替えが必要**。
+> （design.md §M3 で "appliance sandbox 制約は未確認/要検証" としていた点が、本実行で**否定的に確定**）。
+> `import sys` のみ除去した最小候補（相対/絶対 import・local import 検証 OK）は用意済みだが、
+> `os`/`json`/`open()` が残るため通らない見込み（次の 400 を取る確認アップロードは harness の
+> 本番デプロイ保護により要・明示承認）。**ability 再設計はこの deploy 実行タスク（chore/minimal）の
+> 範囲を超える**ため、別タスク化/スコープ判断を窓口へ判断仰ぎ。
+
+### 7.6b ✅ B（SSH 無し経路）の答え＝OpenHome 管理ストレージ
+sandbox が raw `open()` を禁じ `capability_worker.read_file/write_file` を強制する事実は、そのまま
+**「SSH でローカルにキューファイルを置く」必要が無い**ことを意味する。SDK Reference の協調パターン:
+> "Main writes data to persistent file storage. Background polls that file on a timer and acts on it."
+⇒ 再設計後は **interactive(main.py) が `write_file` でサンプルを書き → background が `read_file` で読んで speak()**。
+seed_queue.py の SSH 配置も `APPROVAL_VOICE_QUEUE` 絶対パスも不要になり、**smoke test に SSH 不要**。
+（= 窓口 B 要求「SSH を知らなくても smoke に到達」の最短経路。ただし上記 7.5c の再設計が前提。）
+
 ### 7.7 残ブロッカー（推測で代替不可・窓口へ判断仰ぎ済み）
-1. **`OPENHOME_JWT`（セッショントークン）未提供** → cloud のデプロイ連鎖（add-capability→install→enable）が全て 401。
-   入手法: ダッシュボード（app.openhome.com）ログイン後、DevTools › Network の任意 XHR の
-   `Authorization: Bearer <token>` の **Bearer 以降**を採取。鍵同様 inline・非永続で worker に渡せば worker が REST 駆動可。
-   ※ AccessToken は短命（数分〜）。引き渡し直前に取得し、可能なら refresh/長命トークン有無も確認。
-2. **DevKit の SSH 資格情報未提供** → device 上での queue 配置（`seed_queue.py`＋`APPROVAL_VOICE_QUEUE`）と
-   ability ログ採取ができない。SSH ユーザ名＋鍵/パスワードの提供、または依頼者が DevKit 端末上で直接操作。
+1. ~~`OPENHOME_JWT` 未提供~~ → **解決**（窓口より受領。auth 系統は全て疎通確認済み）。
+2. **【最重要】Ability sandbox 非互換 → ability 再設計が必要（スコープ判断）**: §7.5c の通り、現行 ability は
+   `os`/top-level `json`/raw `open()`/`sys.path` 依存で add-capability の静的スキャンを通過できない。
+   `capability_worker.read_file/write_file/check_if_file_exists` ベースへトランスポートを作り替える必要があり、
+   これは pure-logic（単一の真実源）と transport の設計変更＝本 deploy 実行タスク（chore/minimal）の範囲外。
+   → **要判断**: (a) 別タスクで M3 ability を sandbox 準拠に再設計するか、(b) 別アプローチか。
+3. **harness の本番デプロイ保護**: code 編集済み capability の add-capability アップロードは Claude Code の
+   auto-mode classifier に 2 回ブロックされた（本番外部サービスへの write／編集コードの扱い）。
+   再設計後の正式アップロードには、窓口/依頼者からの**明示的な実行承認**（または該当 Bash 権限の許可）が要る。
+4. ~~DevKit SSH creds~~ → **smoke には不要化**（§7.6b。OpenHome 管理ストレージ経由で SSH レス。
+   ただし device ログでの speak() 証跡採取を望む場合は別途 SSH か依頼者の device 操作が要る）。
 
 ---
 
