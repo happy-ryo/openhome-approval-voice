@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import os
 import py_compile
+import re
 import shutil
 import subprocess
 import sys
@@ -73,16 +74,40 @@ _SAMPLE_QUEUE = os.path.join(_REPO_ROOT, "examples", "announce_queue.json")
 # openhome_ability/ から zip ルートへ持っていく実行時ファイル
 _ABILITY_FILES = ("main.py", "background.py", "__init__.py", "requirements.txt")
 
+# approval_voice/ のうち **bundle に入れない** モジュール（OpenHome sandbox は
+# filesystem モジュール/raw file-open を禁止するため、それらを使う PC 側 I/O や
+# M2 モックは on-device バンドルから除外する。単一の真実源は保ったまま、bundle は
+# entry が import する純モジュールだけに絞る）:
+#   fileio.py  … PC/テスト用のファイル I/O（os/pathlib）。device は capability_worker。
+#   ability.py … M2 モック（device では未使用）。
+#   speak.py   … speak() モック（device は capability_worker.speak）。
+_BUNDLE_EXCLUDE = ("fileio.py", "ability.py", "speak.py")
+
+# bundle 用の最小 __init__（除外モジュールを import しない・走査面を最小化）。
+_BUNDLE_INIT = (
+    '"""approval_voice (on-device bundle subset).\n\n'
+    "Pure, sandbox-safe modules only; PC-side file I/O lives in approval_voice.fileio\n"
+    'which is excluded from this bundle (see deploy/build_zip.py)."""\n'
+)
+
 _DEFAULT_ZIP = os.path.join(_REPO_ROOT, "dist", "approval-voice-ability.zip")
 
 
 def _copy_package(src_pkg: str, dst_pkg: str) -> None:
-    """approval_voice/ を __pycache__ を除いてコピーする。"""
+    """approval_voice/ を bundle 用にコピー（除外モジュール + bytecode を外す）。
+
+    除外したうえで、bundle の `__init__.py` を最小版で上書きする（元 __init__ は
+    除外モジュール speak を import するため、そのままだと bundle 内で壊れる）。
+    """
     shutil.copytree(
         src_pkg,
         dst_pkg,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        ignore=shutil.ignore_patterns(
+            "__pycache__", "*.pyc", "*.pyo", *_BUNDLE_EXCLUDE
+        ),
     )
+    with open(os.path.join(dst_pkg, "__init__.py"), "w", encoding="utf-8") as f:
+        f.write(_BUNDLE_INIT)
 
 
 def stage(stage_root: str) -> None:
@@ -109,6 +134,45 @@ def py_compile_tree(root: str) -> None:
                     src = os.path.join(dirpath, f)
                     cfile = os.path.join(cache, f + "c")
                     py_compile.compile(src, cfile=cfile, doraise=True)
+
+
+# OpenHome capability sandbox の禁止 import/パターン（docs.openhome.com SDK
+# reference + 実測の add-capability 400 で確定）。bundle 内の全 .py をスキャンし、
+# 1 つでも該当したらアップロード前にローカルで弾く（= 「local green == bundle clean」
+# を、ハンドメンテのリストではなく **実際にステージされたファイル** で担保する）。
+_FORBIDDEN_IMPORT = re.compile(r"^\s*(?:import|from)\s+(os|sys|signal|pickle|subprocess)\b")
+_TOPLEVEL_JSON = re.compile(r"^(?:import|from)\s+json\b")  # 行頭=top-level のみ禁止
+_RAW_OPEN = re.compile(r"\bopen\s*\(")
+_EVAL_EXEC = re.compile(r"\b(eval|exec)\s*\(")
+_PATHLIB = re.compile(r"\bpathlib\b")
+
+
+def scan_bundle_clean(stage_root: str) -> None:
+    """bundle 内 .py に sandbox 禁止トークンが無いことを実証する。"""
+    offenders: list[str] = []
+    for dirpath, dirs, files in os.walk(stage_root):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for f in sorted(files):
+            if not f.endswith(".py"):
+                continue
+            full = os.path.join(dirpath, f)
+            rel = os.path.relpath(full, stage_root).replace(os.sep, "/")
+            with open(full, encoding="utf-8") as fh:
+                for i, line in enumerate(fh, 1):
+                    for rx, label in (
+                        (_FORBIDDEN_IMPORT, "forbidden import"),
+                        (_TOPLEVEL_JSON, "top-level import json"),
+                        (_RAW_OPEN, "raw open()"),
+                        (_EVAL_EXEC, "eval()/exec()"),
+                        (_PATHLIB, "pathlib"),
+                    ):
+                        if rx.search(line):
+                            offenders.append(f"{rel}:{i}: {label}: {line.strip()}")
+    if offenders:
+        raise AssertionError(
+            "bundle is NOT sandbox-clean (OpenHome would 400 add-capability):\n  "
+            + "\n  ".join(offenders)
+        )
 
 
 def make_zip(stage_root: str, zip_path: str, arc_prefix: str = "") -> None:
@@ -172,23 +236,28 @@ def verify_zip(zip_path: str, arc_prefix: str = "") -> None:
             sys.path.insert(0, %(stub)r)   # src.* スタブ
             sys.path.insert(0, %(run)r)    # bundle ルート（background.py も同じ場所を積む）
 
-            # 1) 実機 ability を import（from approval_voice... が解決すること）
+            # 1) 実機 ability を import（bundle 内 from approval_voice... が解決すること）
             import background
             import main
             assert hasattr(background, "ApprovalVoiceWatcher")
             assert hasattr(main, "ApprovalVoiceStatus")
 
-            # 2) 実データ経路（4 ゲートサンプル）を流す
-            from approval_voice.bridge import load_queue
+            # 2) 実データ経路を **on-device と同じ codec 経路** で流す（bundle のみ）:
+            #    main.py の書込ペイロード -> background.py の読込 -> dedup -> 4 ゲート描画
+            from approval_voice.transport import SAMPLE_NOTIFICATIONS
+            from approval_voice.bridge import notification_to_item
+            from approval_voice.codec import items_to_json_str, items_from_json_str
             from approval_voice.poller import ReadCursor
             from approval_voice.renderer import render_speech
-            items = load_queue(%(sample)r)
-            fresh = ReadCursor().unread(items)
+            items = [notification_to_item(n) for n in SAMPLE_NOTIFICATIONS]
+            raw = items_to_json_str(items)          # = main.py が write_file する文字列
+            reread = items_from_json_str(raw)       # = background.py が read_file 後に parse
+            fresh = ReadCursor().unread(reread)
             spoken = [render_speech(i) for i in fresh]
             assert len(spoken) == 4, len(spoken)
             print("VERIFY_OK", len(spoken))
             """
-        ) % {"stub": stub_root, "run": run_dir, "sample": _SAMPLE_QUEUE}
+        ) % {"stub": stub_root, "run": run_dir}
 
         env = dict(os.environ)
         env.pop("PYTHONPATH", None)
@@ -214,6 +283,8 @@ def build(zip_path: str, root_folder: str = "", verify: bool = True) -> str:
         stage(stage_root)
         py_compile_tree(stage_root)
         print(f"[stage] py_compile OK ({stage_root})")
+        scan_bundle_clean(stage_root)
+        print("[stage] sandbox scan OK (no forbidden import/open)")
         make_zip(stage_root, zip_path, arc_prefix)
         print(f"[zip] wrote {zip_path}")
     if verify:

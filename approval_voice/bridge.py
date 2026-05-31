@@ -12,25 +12,16 @@ M2 note (§4): the org side is replaced by a *hand-written* notification dict.
 The input shape here is deliberately conceptual — it does NOT mirror any real
 claude-org state schema (public hygiene). M3 replaces this input with a real,
 read-only export from live state.
+
+Scope: this module holds only the pure mapping/hygiene filter
+(`notification_to_item`). The actual queue file write lives in
+`approval_voice.fileio` (PC side); keeping this module free of filesystem access
+lets it ship inside the on-device ability bundle if needed.
 """
 
 from __future__ import annotations
 
-import json
-import os
-from pathlib import Path
-
 from .schema import AnnounceItem
-
-
-def _atomic_write_text(path: str | Path, text: str) -> None:
-    """Write via temp file + os.replace so the on-device poller (background.py)
-    never reads a half-written queue (M3 transport reliability, design.md §M3)."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, p)
 
 
 def notification_to_item(notification: dict) -> AnnounceItem:

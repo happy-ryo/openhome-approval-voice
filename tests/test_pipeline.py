@@ -1,11 +1,14 @@
 """Bridge + poller + ability data-path tests (design.md §1.2, §3.2)."""
 
+import json
 from pathlib import Path
 
 from approval_voice.ability import ApprovalVoiceAbility
-from approval_voice.bridge import export_queue, load_queue, notification_to_item
-from approval_voice.poller import ReadCursor, load_seen, save_seen
+from approval_voice.bridge import notification_to_item
+from approval_voice.fileio import export_queue, load_queue, load_seen, save_seen
+from approval_voice.poller import ReadCursor
 from approval_voice.schema import GATES, AnnounceItem
+from approval_voice.transport import SAMPLE_NOTIFICATIONS
 
 
 def _items():
@@ -21,6 +24,14 @@ def test_example_queue_loads_and_covers_all_gates(tmp_path=None):
     queue = Path(__file__).parent.parent / "examples" / "announce_queue.json"
     items = load_queue(queue)
     assert {i.gate for i in items} == set(GATES)
+
+
+def test_sample_matches_example():
+    # Single source of truth: the in-bundle smoke sample (seeded on-device by
+    # main.py via write_file) must stay identical to the committed example file.
+    example = Path(__file__).parent.parent / "examples" / "announce_queue.json"
+    on_disk = json.loads(example.read_text(encoding="utf-8"))
+    assert SAMPLE_NOTIFICATIONS == on_disk
 
 
 def test_bridge_is_public_hygiene_filter():
