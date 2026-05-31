@@ -4,7 +4,7 @@ from pathlib import Path
 
 from approval_voice.ability import ApprovalVoiceAbility
 from approval_voice.bridge import export_queue, load_queue, notification_to_item
-from approval_voice.poller import ReadCursor
+from approval_voice.poller import ReadCursor, load_seen, save_seen
 from approval_voice.schema import GATES, AnnounceItem
 
 
@@ -76,3 +76,31 @@ def test_unknown_gate_rejected():
 
     with pytest.raises(ValueError):
         AnnounceItem(id="x", gate="not_a_gate", title="t", question="q")
+
+
+def test_seen_cursor_persists_across_restart(tmp_path):
+    # M3: the on-device daemon restarts; a persisted cursor must suppress
+    # already-spoken gates so they are never re-read aloud.
+    seen_file = tmp_path / "nested" / "announce_seen.json"  # parent auto-created
+    assert load_seen(seen_file) == set()                    # missing -> empty
+
+    cursor = ReadCursor()
+    cursor.mark_read([AnnounceItem(id="a", gate="ci_merge", title="t", question="q")])
+    save_seen(seen_file, cursor)
+
+    assert load_seen(seen_file) == {"a"}
+
+
+def test_seen_cursor_corrupt_file_is_empty(tmp_path):
+    bad = tmp_path / "announce_seen.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert load_seen(bad) == set()  # corrupt cursor must not crash the daemon
+
+
+def test_export_queue_is_atomic_and_roundtrips(tmp_path):
+    # Atomic write leaves no stray .tmp and yields a fully-parseable queue.
+    out = tmp_path / "announce_queue.json"
+    export_queue([{"id": "z", "gate": "escalation", "question": "q"}], out)
+    assert out.exists()
+    assert not (tmp_path / "announce_queue.json.tmp").exists()
+    assert [i.id for i in load_queue(out)] == ["z"]

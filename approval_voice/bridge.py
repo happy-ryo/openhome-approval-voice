@@ -17,9 +17,20 @@ read-only export from live state.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from .schema import AnnounceItem
+
+
+def _atomic_write_text(path: str | Path, text: str) -> None:
+    """Write via temp file + os.replace so the on-device poller (background.py)
+    never reads a half-written queue (M3 transport reliability, design.md §M3)."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, p)
 
 
 def notification_to_item(notification: dict) -> AnnounceItem:
@@ -55,7 +66,7 @@ def export_queue(notifications: list[dict], queue_path: str | Path) -> list[Anno
     """
     items = [notification_to_item(n) for n in notifications]
     payload = [item.to_dict() for item in items]
-    Path(queue_path).write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    _atomic_write_text(
+        queue_path, json.dumps(payload, ensure_ascii=False, indent=2)
     )
     return items

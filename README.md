@@ -3,8 +3,8 @@
 Secretary が判断仰ぎ/承認待ち(`awaiting_user`)で停止した瞬間、OpenHome が質問と選択肢を音声で読み上げる
 **一方向**連携（音声返答キャプチャなし — 返事は端末から）。claude-org × OpenHome 連携チャレンジ。
 
-ロードマップ: **M1 設計** → **M2 PoC（モック）← 現在** → M3 実接続。
-設計の詳細は `docs/design.md`（M1 成果物）を参照。
+ロードマップ: **M1 設計** → **M2 PoC（モック）** → **M3 実 OpenHome 接続 ← 現在**。
+設計の詳細は `docs/design.md`（M1 + M3 実測で確定）を参照。
 
 ## M2 のスコープ
 
@@ -29,7 +29,47 @@ awaiting_user 通知 → ブリッジ(read-only) → 共有キューJSON → 既
 | `approval_voice/ability.py` | Background Ability skeleton（§5-2）。poll → render → speak。 |
 | `approval_voice/speak.py` | OpenHome `speak()` のモック。発話文字列を stdout/ログへ。 |
 | `examples/announce_queue.json` | 手書きモックキュー（4 ゲート 1 件ずつ）。 |
-| `run_demo.py` | エンドツーエンド デモ。 |
+| `run_demo.py` | エンドツーエンド デモ（モック）。 |
+| `openhome_ability/background.py` | **M3 実機**: 常駐 Background Ability。キューを `open()` で polling → 逐語 `speak()`。 |
+| `openhome_ability/main.py` | **M3 実機**: 一方向の状態通知エントリ（入力取得なし）。 |
+
+> M2 のモック（`approval_voice/ability.py`・`speak.py`・`run_demo.py`）は**単体テスト用に保持**。
+> M3 の実読み上げは `openhome_ability/`（実 OpenHome SDK 形）。
+
+## M3: 実 OpenHome 接続（DevKit on-device 逐語）
+
+実測で確定した経路は **(C) DevKit on-device で `speak()` 直接 TTS による逐語読み上げ**。
+cloud WebSocket は送信 text を LLM が**言い換える**ため承認用途に不適で不採用（`docs/design.md` §M3）。
+
+### 鍵の扱い（厳守）
+
+- `OPENHOME_API_KEY` は**環境変数からのみ**。コード/`.env`/設定/コミット/ログに**絶対残さない**（public リポ）。
+- ライブ実行は「その呼び出しだけ環境変数を前置」:
+  - bash: `OPENHOME_API_KEY=**** py -3 your_script.py`
+  - pwsh: `$env:OPENHOME_API_KEY="****"; py -3 your_script.py`
+- `npx openhome-cli` は鍵を**ローカル disk に永続化**する。**依頼者の手元マシンでのみ**使用し、本リポには持ち込まない。
+
+### デプロイ手順（依頼者が手元 DevKit で実施）
+
+1. **DevKit を用意**: 実機、または Raspberry Pi(Zero 2 W/Pi 4/Pi 5)に OpenHome OS を flash。
+   iOS アプリ もしくは OpenHome Client でアカウント接続し鍵を端末同期。
+2. **専用エージェントを作成**（Dashboard の Quick Creation）。raw_prompt は逐語固定の例:
+   「ユーザの発話を一字一句そのまま読み上げる。要約・言い換え・追加発言はしない。」
+   （※ on-device の `speak()` は直接 TTS なので逐語性は保証されるが、会話フォールバック時の保険）。
+   既存エージェントには影響させない。
+3. **ability をバンドル**: `openhome_ability/` に純ロジック `approval_voice/`（`renderer/schema/poller/bridge`）を
+   同梱（`background.py` が import する単一の真実源。重複実装は作らない）。
+4. **アップロード**: `npx openhome-cli` の deploy、または
+   `curl -X POST https://app.openhome.com/api/capabilities/add-capability/ -H "X-API-KEY: ****" -F "name=approval-voice" -F "category=background" -F "description=..." -F "trigger_words=承認読み上げ, approval voice" -F "zip_file=@./openhome_ability.zip"`
+   （`name`/`category`/`description`/`trigger_words`/`zip_file` は必須）。
+   対象エージェントに install/enable。
+5. **キューのパスを設定**（任意・既定は `~/.openhome/approval_voice/`）:
+   `APPROVAL_VOICE_QUEUE` / `APPROVAL_VOICE_SEEN` / `APPROVAL_VOICE_POLL_SECONDS`。
+6. **bridge を端末で起動**して `awaiting_user` 通知をキューに書き出す（同一端末に同居）。
+7. **end-to-end 確認**: ゲート発火 → bridge がキューを atomic 書き込み → ability が検知 →
+   `send_interrupt_signal()` → **逐語読み上げ**。
+   - ✅ 成功条件: 文面が**そのまま**（言い換えなし）聞こえる／自発話が**再転写されない**。
+   - 失敗（import エラー/パス不一致/無音 等）は窓口へ報告（コードのデプロイ形を修正します）。
 
 ## 実行方法（Windows）
 
