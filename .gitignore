@@ -1,0 +1,11 @@
+# Worker/orchestration artifacts — must NOT land in the public repo
+CLAUDE.md
+send_plan.json
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/

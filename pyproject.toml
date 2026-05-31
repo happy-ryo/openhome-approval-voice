@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openhome-approval-voice"
+version = "0.2.0"  # M2 PoC scaffold
+description = "One-way voice readout of Secretary awaiting_user approval gates (OpenHome, mocked in M2)"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["approval_voice"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
