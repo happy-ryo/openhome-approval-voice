@@ -239,6 +239,73 @@ OpenHome ランタイム経由で、§3 で enable した capability の **backg
 
 ---
 
+## 7. ライブ調査で判明した実値・実エンドポイント（Refs #7・本デプロイ実行時に実測）
+
+> 鍵・JWT・グローバル IPv6 などの機微値は本書では**伏字**。実値は完了報告（peer message）で窓口にのみ伝える。
+
+### 7.1 API ベース／スキーマの実在ソース
+- OpenAPI 2.0 スキーマ（権威ソース）: `GET https://app.openhome.com/api/swagger/?format=.json`
+  （`/swagger.json` や `?format=openapi` は UI HTML/406 を返す。`?format=.json` が JSON 実体）。
+- 当て推量パスは Django の 404 デバッグページ（`DEBUG=True`）が urlconf を露出するため、
+  プレフィックス一覧（`api/capabilities/` `api/personalities/` `api/devkit/` 等）を確認できる。
+
+### 7.2 認証モデル（最重要・実測で判明）
+- **2 系統が混在**。`X-API-KEY` ヘッダで通るのは**読み取りの一部のみ**:
+  - ✅ `GET /api/accounts/get-user/`（200。ユーザ id=93883 / Google サインイン・`has_password:false`）
+  - ✅ `GET /api/personalities/get-all-personalities/`（200。= 旧称「agents」）
+  - ✅ `GET /api/capabilities/get-installed-capabilities/`（200）
+- それ以外（**add-capability / install / enable / get-all-capabilities / get/categories / devkit/get-devices** 等）は
+  `Authorization: Bearer <JWT AccessToken>`（rest_framework_simplejwt）が必須。`X-API-KEY` では **401**。
+  - 実証: `OPTIONS` と実 `POST` の両方で `add-capability` → `401 Authentication credentials were not provided`（=何も作成されない）。
+  - `Authorization: Bearer <API_KEY>` は `token_not_valid`（API キーは JWT ではない）。
+- `has_password:false`（Google OAuth）のため `/accounts/login/` で JWT を発行できない。
+- 公式 `openhome-cli`（npm `openhome-cli@0.1.40`）の README も **`OPENHOME_API_KEY` と `OPENHOME_JWT` の両方**を要求
+  （`openhome deploy <zip> --name --category --triggers` / `openhome assign --agent --capabilities`）。
+  ⇒ **デプロイ系には JWT セッショントークンが必須**。API キー単独では不可（要検証ではなく実測確定）。
+
+### 7.3 実エンドポイント（正しいパス）
+| 操作 | メソッド・パス | 認証 |
+|---|---|---|
+| エージェント一覧（=personalities） | `GET /api/personalities/get-all-personalities/` | X-API-KEY 可 |
+| capability アップロード | `POST /api/capabilities/add-capability/`（multipart: `zip_file,name,category,description,trigger_words,template,selected_keys,image_file`） | **JWT 必須** |
+| capability 一覧 | `GET /api/capabilities/get-all-capabilities/` | **JWT 必須** |
+| カテゴリ一覧 | `GET /api/capabilities/get/categories/` | **JWT 必須** |
+| install | `GET /api/capabilities/install-capability/{capability_id}/` | **JWT 必須** |
+| release 有効化 | `POST /api/capabilities/enable/release/{release_id}/` | **JWT 必須** |
+| release 一覧 | `GET /api/capabilities/list/capability-releases/{capability_id}/` | **JWT 必須** |
+| agent の capability | `GET /api/capabilities/get/agent-capabilities/{user_id}/` | **JWT 必須** |
+| DevKit デバイス一覧 | `GET /api/devkit/get-devices/` | **JWT 必須** |
+
+> ⚠️ DEPLOY.md §2/§3 の旧記載（`get-all-agents/` パス・`X-API-KEY` のみでアップロード可）は**実測で否定**。
+> 正は本節。`/api/agents/...` というプレフィックスは存在せず、エージェント＝`personalities`。
+
+### 7.4 専用エージェント（特定済み）
+- **山彦（Yamabiko）`id=590628`**＝逐語読み上げ専用エージェント（description「ユーザの発話を一字一句そのまま読み上げる…要約・言い換え・追加…」）。
+- approval-voice capability は**未アップロード／未インストール**（installed は OpenHome 既定 6 件のみ）。重複なし。
+
+### 7.5 `category` 値の要検証
+- DEPLOY.md §2 は `category=background`。だが installed caps の実カテゴリ値は
+  `background_daemon` / `skill` / `brain_skill`。⇒ **`category=background` は要検証**。
+  `get/categories/`（JWT 必須）で正値を読んでから upload すること（JWT 入手後に確定）。
+
+### 7.6 DevKit 到達手段（LAN・read-only で実測）
+- **mDNS `openhome.local` で到達可**（ping 応答 2–5ms / 0% loss）。`raspberrypi.local` は不在。
+  （実 IPv6 アドレスは公開リポ衛生のため**伏字**。完了報告で窓口に伝達。）
+- **SSH(22) OPEN**: バナー `SSH-2.0-OpenSSH_10.0p2 Debian-7+deb13u2`（Debian 13 ベース＝Pi DevKit イメージと整合）。
+- HTTP 80/8080/443 は応答なし（DevKit 上に Web サービスは無し）。
+- ⇒ 到達は可能だが **SSH ログイン資格情報（ユーザ名＋鍵/パスワード）は未提供**。
+  認証ブルートフォース・既定資格情報の当て推量は**禁止につき試行せず**（要 escalation）。
+
+### 7.7 残ブロッカー（推測で代替不可・窓口へ判断仰ぎ済み）
+1. **`OPENHOME_JWT`（セッショントークン）未提供** → cloud のデプロイ連鎖（add-capability→install→enable）が全て 401。
+   入手法: ダッシュボード（app.openhome.com）ログイン後、DevTools › Network の任意 XHR の
+   `Authorization: Bearer <token>` の **Bearer 以降**を採取。鍵同様 inline・非永続で worker に渡せば worker が REST 駆動可。
+   ※ AccessToken は短命（数分〜）。引き渡し直前に取得し、可能なら refresh/長命トークン有無も確認。
+2. **DevKit の SSH 資格情報未提供** → device 上での queue 配置（`seed_queue.py`＋`APPROVAL_VOICE_QUEUE`）と
+   ability ログ採取ができない。SSH ユーザ名＋鍵/パスワードの提供、または依頼者が DevKit 端末上で直接操作。
+
+---
+
 ## 付録: ファイル一覧
 
 | パス | 役割 |
