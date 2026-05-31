@@ -97,13 +97,18 @@ def stage(stage_root: str) -> None:
 
 
 def py_compile_tree(root: str) -> None:
-    """root 配下の全 .py を構文チェックする（.pyc を残さない）。"""
-    for dirpath, _dirs, files in os.walk(root):
-        for f in files:
-            if f.endswith(".py"):
-                src = os.path.join(dirpath, f)
-                # cfile=os.devnull: 構文チェックだけして bytecode を残さない
-                py_compile.compile(src, cfile=os.devnull, doraise=True)
+    """root 配下の全 .py を構文チェックする（bytecode はステージへ残さない）。
+
+    .pyc は throwaway temp ディレクトリへ書かせ、ステージ（=zip 元）には
+    残さない（zip に .pyc を混入させないため。make_zip 側でも除外する二重防御）。
+    """
+    with tempfile.TemporaryDirectory() as cache:
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                if f.endswith(".py"):
+                    src = os.path.join(dirpath, f)
+                    cfile = os.path.join(cache, f + "c")
+                    py_compile.compile(src, cfile=cfile, doraise=True)
 
 
 def make_zip(stage_root: str, zip_path: str, arc_prefix: str = "") -> None:
