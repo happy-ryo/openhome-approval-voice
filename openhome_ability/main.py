@@ -24,9 +24,8 @@ from src.agent.capability import MatchingCapability
 from src.agent.capability_worker import CapabilityWorker
 from src.main import AgentWorker
 
-from approval_voice.bridge import notification_to_item
-from approval_voice.codec import items_to_json_str
-from approval_voice.transport import QUEUE_NAME, SAMPLE_NOTIFICATIONS
+from approval_voice.bridge import sample_queue_json
+from approval_voice.transport import QUEUE_NAME
 
 _PERSIST = False  # share persistent storage with the daemon (background.py)
 

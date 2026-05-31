@@ -20,6 +20,13 @@ SEEN_NAME = "approval_voice_seen.json"
 # Watcher poll interval (seconds). Constant — the bundle cannot read env vars.
 POLL_SECONDS = 15.0
 
+# Smoke bootstrap: when True, the always-on watcher self-seeds the sample if the
+# queue is absent, so an *enabled* daemon speaks the 4 gates on its own — no voice
+# trigger, no interactive entry, no SSH (the requester just listens; audible
+# speak() is the only ground truth when device logs aren't reachable).
+# Set False for production: seeding is then owned solely by the bridge/exporter.
+SMOKE_BOOTSTRAP = True
+
 # Canonical smoke sample: the four awaiting_user gates, one each.
 SAMPLE_NOTIFICATIONS = [
     {

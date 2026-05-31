@@ -35,6 +35,7 @@ from src.agent.capability import MatchingCapability
 from src.agent.capability_worker import CapabilityWorker
 from src.main import AgentWorker
 
+from approval_voice.bridge import sample_queue_json
 from approval_voice.codec import (
     items_from_json_str,
     seen_from_json_str,
@@ -42,7 +43,13 @@ from approval_voice.codec import (
 )
 from approval_voice.poller import ReadCursor
 from approval_voice.renderer import render_speech
-from approval_voice.transport import POLL_SECONDS, QUEUE_NAME, SEEN_NAME
+from approval_voice.transport import (
+    POLL_SECONDS,
+    QUEUE_NAME,
+    SAMPLE_NOTIFICATIONS,
+    SEEN_NAME,
+    SMOKE_BOOTSTRAP,
+)
 
 # Persistent storage scope so the read-cursor survives daemon restarts and is
 # shared with the interactive seeder (main.py).
@@ -70,6 +77,25 @@ class ApprovalVoiceWatcher(MatchingCapability):
             await self.capability_worker.delete_file(SEEN_NAME, _PERSIST)
         await self.capability_worker.write_file(
             SEEN_NAME, seen_to_json_str(cursor.seen), _PERSIST
+        )
+
+    async def _maybe_bootstrap(self) -> None:
+        """Smoke only: if the queue is absent, seed the sample so an *enabled*
+        daemon speaks the gates on its own — no voice trigger / interactive entry
+        / SSH needed (audible speak() is the only ground truth when device logs
+        aren't reachable). Production (SMOKE_BOOTSTRAP=False) leaves seeding to
+        the bridge. Idempotent: once the queue exists it never re-seeds, and the
+        read-cursor prevents re-reading already-spoken gates."""
+        if not SMOKE_BOOTSTRAP:
+            return
+        if await self.capability_worker.check_if_file_exists(QUEUE_NAME, _PERSIST):
+            return
+        await self.capability_worker.write_file(
+            QUEUE_NAME, sample_queue_json(), _PERSIST
+        )
+        self.worker.editor_logging_handler.info(
+            "[ApprovalVoice] SMOKE_BOOTSTRAP — seeded %d sample gate(s)"
+            % len(SAMPLE_NOTIFICATIONS)
         )
 
     async def _read_aloud(self, fresh: list) -> list:
@@ -105,6 +131,12 @@ class ApprovalVoiceWatcher(MatchingCapability):
             "[ApprovalVoice] background.py ACTIVE — polling %s every %ss"
             % (QUEUE_NAME, POLL_SECONDS)
         )
+        try:
+            await self._maybe_bootstrap()
+        except Exception as e:
+            self.worker.editor_logging_handler.info(
+                "[ApprovalVoice] bootstrap error: %s" % e
+            )
         while True:
             try:
                 spoken = await self._poll_tick()

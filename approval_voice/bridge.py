@@ -21,7 +21,9 @@ lets it ship inside the on-device ability bundle if needed.
 
 from __future__ import annotations
 
+from . import codec
 from .schema import AnnounceItem
+from .transport import SAMPLE_NOTIFICATIONS
 
 
 def notification_to_item(notification: dict) -> AnnounceItem:
@@ -42,22 +44,12 @@ def notification_to_item(notification: dict) -> AnnounceItem:
     )
 
 
-def load_queue(queue_path: str | Path) -> list[AnnounceItem]:
-    """Read the shared announce queue (JSON array) into AnnounceItems."""
-    raw = Path(queue_path).read_text(encoding="utf-8")
-    data = json.loads(raw)
-    return [AnnounceItem.from_dict(entry) for entry in data]
+def sample_queue_json() -> str:
+    """The canonical smoke sample as announce-queue text.
 
-
-def export_queue(notifications: list[dict], queue_path: str | Path) -> list[AnnounceItem]:
-    """Map notifications -> items and write the shared queue (append-only intent).
-
-    Writes the full array for the M2 mock; the real bridge appends. Returns the
-    items written so callers can assert on them without re-reading the file.
+    Single seeding source for both the interactive entry (main.py) and the
+    daemon's smoke bootstrap (background.py), built from the shared
+    SAMPLE_NOTIFICATIONS through the same hygiene filter + codec as a real queue.
     """
-    items = [notification_to_item(n) for n in notifications]
-    payload = [item.to_dict() for item in items]
-    _atomic_write_text(
-        queue_path, json.dumps(payload, ensure_ascii=False, indent=2)
-    )
-    return items
+    items = [notification_to_item(n) for n in SAMPLE_NOTIFICATIONS]
+    return codec.items_to_json_str(items)
