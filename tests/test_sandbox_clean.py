@@ -50,13 +50,21 @@ def test_bundle_builds_clean_and_minimal(tmp_path):
         assert needed in names, f"{needed} missing from bundle"
 
 
-def test_scan_rejects_a_forbidden_import(tmp_path):
-    # Negative control: the scanner must actually fire on a planted violation.
-    bad = tmp_path / "bad_pkg"
-    (bad).mkdir()
-    (bad / "evil.py").write_text("import os\n", encoding="utf-8")
+def _expect_flagged(tmp_path, name, source):
+    pkg = tmp_path / name
+    pkg.mkdir()
+    (pkg / "evil.py").write_text(source, encoding="utf-8")
     try:
-        build_zip.scan_bundle_clean(str(bad))
+        build_zip.scan_bundle_clean(str(pkg))
     except AssertionError:
         return
-    raise AssertionError("scan_bundle_clean failed to flag `import os`")
+    raise AssertionError(f"scan_bundle_clean failed to flag: {source!r}")
+
+
+def test_scan_rejects_forbidden_patterns(tmp_path):
+    # Negative controls: the scanner must actually fire on planted violations,
+    # including the dunder-attribute-access rule (cls.<dunder>) the server enforces.
+    _expect_flagged(tmp_path, "a_import", "import os\n")
+    _expect_flagged(tmp_path, "b_open", "data = open('x')\n")
+    _expect_flagged(tmp_path, "c_json", "import json\n")
+    _expect_flagged(tmp_path, "d_dunder", "f = cls.__dataclass_fields__\n")

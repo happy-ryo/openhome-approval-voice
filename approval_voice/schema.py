@@ -13,7 +13,12 @@ in an AnnounceItem.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
+
+# Explicit field list — used instead of dataclass field-introspection because the
+# OpenHome capability sandbox forbids dunder attribute access in bundled code.
+# Keep in sync with the dataclass fields declared below.
+_ITEM_FIELDS = ("id", "gate", "title", "question", "subject", "options", "created_at")
 
 # The four awaiting_user gates the Secretary stops on (design.md §2).
 GATE_WORKER_COMPLETE = "worker_complete"
@@ -49,8 +54,18 @@ class AnnounceItem:
 
     @classmethod
     def from_dict(cls, data: dict) -> "AnnounceItem":
-        known = {f: data[f] for f in cls.__dataclass_fields__ if f in data}
+        known = {f: data[f] for f in _ITEM_FIELDS if f in data}
         return cls(**known)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        # Explicit dict (no dataclasses.asdict / dunder introspection): only the
+        # whitelisted §1.3 fields cross the wire (public hygiene, single choke).
+        return {
+            "id": self.id,
+            "gate": self.gate,
+            "title": self.title,
+            "question": self.question,
+            "subject": self.subject,
+            "options": list(self.options),
+            "created_at": self.created_at,
+        }
