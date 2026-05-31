@@ -433,6 +433,70 @@ CLI `src/api/{endpoints,client}.ts` で各ステップの実 REST を確定（**
 
 ---
 
+## 9. 残作業の実行キット（窓口/依頼者用・SSH レス完遂手順）
+
+クラウド側は cap **5399** 作成・install・v1 enabled・**山彦590628 紐付け（非破壊確認済）**まで完了。
+残りは「bootstrap 入りコード(commit cafdc2d)を 5399 へ反映 → 新版を enabled に → DevKit で山彦起動→4ゲート試聴」。
+全 curl は `JWT=$OPENHOME_JWT`、zip 絶対パス(bash)=
+`/c/Users/iwama/Documents/work/org/workers/openhome-approval-voice/.worktrees/openhome-approval-voice-devkit-deploy/dist/approval-voice-ability.zip`
+（PowerShell は `curl`→`curl.exe`・`$env:OPENHOME_JWT`・`@C:\…\approval-voice-ability.zip`。日本語フィールドは送らないので OS 差は小）。
+
+### STEP U — コード更新（非破壊・新版作成）PUT
+```
+curl -sS -w '\n[HTTP %{http_code}]\n' -X PUT "https://app.openhome.com/api/capabilities/edit-capability/5399/" \
+  -H "Authorization: Bearer $OPENHOME_JWT" \
+  -F "name=approvalvoice" -F "category=background_daemon" \
+  -F "zip_file=@/c/Users/.../dist/approval-voice-ability.zip"
+```
+成功=HTTP 200。400(sandbox 新ルール)なら本文のトークンを §7.5c に追加対応（build_zip が事前検出）。
+
+### STEP V — 反映確認 GET
+`curl -sS "https://app.openhome.com/api/capabilities/get-all-capabilities/" -H "Authorization: Bearer $OPENHOME_JWT"`
+- 5399 の `capability_versions` から**最新版を特定**＝`id`(version id) が最大の要素（= version 文字列最大 "v2"）。
+- その要素の **`is_user_enabled`**: `true`→enable 不要(STEP X へ) / `false`→STEP W。
+
+### STEP W — enable（最新版が false のときだけ）
+`is_user_enabled` は**バージョン単位**フラグ → **`POST /api/capabilities/enable/release/<最新version_id>/`**（body 不要）。
+> 根拠: CLI(client.ts)の `toggleCapability` は `edit-installed-capability/{id}` で**capability 単位**の enable/disable
+> （既定 installed cap の `"enabled":true` がこれ）。一方 `is_user_enabled` は version 要素のフラグなので、
+> **新バージョンを有効化するのは version 単位の `enable/release/{release_id}`** が正。
+> もし 404/405 等なら代替: `PUT /api/capabilities/edit-installed-capability/5399/ -F "enabled=true" -F "category=background_daemon"`。
+再確認は STEP V を再実行し最新版 `is_user_enabled=true` を見る。
+
+### STEP X — 山彦紐付け維持確認 GET
+`curl -sS "https://app.openhome.com/api/personalities/get-single-personality/590628/" -H "Authorization: Bearer $OPENHOME_JWT"`
+→ `matching_capabilities` に **5399** があればOK。万一消えていたら §8.5 の assign(`PUT edit-personality`,
+`personality_id=590628`＋`matching_capabilities=5399` の2項目のみ＝partial・非破壊)を再実行。
+
+### STEP Y — DevKit で起動→試聴（SSH レス）
+1. OpenHome アプリ/コンパニオンで **山彦(590628) をアクティブ personality** にして DevKit でセッション開始
+   （山彦の `cold_start_message`「起動しました」が出れば起動）。
+2. `background_daemon` は**トリガ語不要**でセッション起動時に常駐開始 → `SMOKE_BOOTSTRAP` がキュー空を検知して
+   サンプル自己投入 → 次 poll(≤15秒)で **4ゲートを逐語 speak**。main.py/音声トリガ/SSH は不要。
+3. 成功条件(§5.3/§8.4): 下記4文面が**言い換え無し**で順に / 4ゲート全部 / 二重読み無し / 自走しない。
+
+聞こえるべき4文面（真実源 = `examples/announce_queue.json` + `renderer.py`）:
+1) ワーカー完了の承認待ちです。ログイン画面のリファクタリング が作業完了を報告しました。承認すると次の工程へ進みます。選択肢は、1 承認、2 差し戻し。返事は端末でお願いします。
+2) マージ承認待ちです。決済モジュールの改修 の CI がグリーンになりました。マージしてよいか確認をお願いします。選択肢は、1 マージ、2 保留。返事は端末でお願いします。
+3) エスカレーションです。通知基盤の刷新 で判断を仰いでいます。内容は『外部 API の仕様変更にどう追随するか方針を決めたい』。選択肢は、1 方針A で進める、2 方針B で進める、3 保留して再検討。返事は端末でお願いします。
+4) 転送された返答待ちです。デザイナー から確認事項が届いています。内容は『デザインレビューの指摘点を確認してほしい』。あなたの返事を待っています。返事は端末でお願いします。
+
+### うまく喋らない時
+- 無音: ①最新版 `is_user_enabled=true`か(V) ②山彦が**アクティブ**かつ `matching_capabilities=[5399]`か(X) ③DevKit 音量/スピーカ。
+- 1回鳴って2回目が鳴らない: **正常**（seen カーソルで dedup）。SSH 不可で seen クリア不可のため**1回読めれば成功**。
+- 「捨てキャップ作成」NG・delete フォールバック: §9 冒頭の通り delete は要・明示 GO（山彦紐付けも消えるので原則 STEP U を使う）。
+
+### 既知 sandbox ルール（次の 400 に備え・§7.5c/§8.3 に詳細）
+禁止: `import os/sys/signal/subprocess/pickle/redis`、**top-level** `import json`（関数内 lazy はOK）、raw `open()`
+（→`capability_worker.read_file/write_file/check_if_file_exists/delete_file`）、`pathlib`、`eval()/exec()`、
+**dunder 属性アクセス `.__x__`**（コメント/docstring 内も拾われる）。ローカル担保=`deploy/build_zip.py::scan_bundle_clean()` ＋ `tests/test_sandbox_clean.py`。
+
+### DEPLOY.md 地図
+§7.2 認証(JWT vs X-API-KEY) / §7.3 実エンドポイント / §7.4 山彦590628 / §7.5c sandbox 禁止 /
+§8.2 bundle in-out / §8.4 SMOKE_BOOTSTRAP smoke / §8.5 deploy 連鎖(add/enable/assign) / §9 本キット。
+
+---
+
 ## 付録: ファイル一覧
 
 | パス | 役割 |
