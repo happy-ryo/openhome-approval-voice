@@ -309,12 +309,69 @@ ability 側ローカルで永続（組織へ書き戻さない＝副作用ゼロ
 
 採用理由（最も単純かつ確実）:
 1. Local Ability の文書化された FS パターン（device パスへの素の `open()`）にそのまま乗る。
-2. ネットワーク/認証が不要（外部 writer=bridge が同一端末に同居）。
+2. ability 側（consumer）は**端末ローカルファイルの読み取りのみ**で完結し、ネットワーク I/O を持たない。
 3. `os.replace` のアトミック rename で poller が**半端な書き込みを絶対に読まない**。
 4. 既読カーソル dedup で二重読み上げ・取りこぼしを防止。
 
 > 代替（同一 ability 内で writer/reader が完結する場合）は SDK の `read_file/write_file`
 > が定石。本件は writer が外部 bridge のため、store 解決の曖昧さを避けて素の `open()` を採る。
+
+> **訂正（Refs #7）**: 旧記述は「writer=bridge が同一端末に同居するためネットワーク不要」と
+> していたが、これは**誤り**。bridge が読む組織の `awaiting_user` 状態は **Secretary（窓口）が
+> 動く PC 上で発生**するため、状態を読む exporter は DevKit に同居できない。本番では
+> PC→DevKit の経路が**必須**になる（下記 §M3.3.1）。「端末ローカルファイル + 素の `open()`」は
+> あくまで ability（consumer）側の**読み取り機構**として有効で、その手前にどう配送するかは別問題。
+
+### M3.3.1 同一 LAN での本番 transport（PC→DevKit, Refs #7）
+
+依頼者の構成: **PC=有線 LAN / DevKit=Wi-Fi / 同一ルーター（＝同一 LAN・同一サブネット）**。
+組織イベント（`awaiting_user`）は PC 上で発生し、読み上げる ability は DevKit 上で動くため、
+bridge は機能上**2 つに割れる**:
+
+| 役割 | 動作場所 | やること | 根拠 |
+|------|----------|----------|------|
+| **exporter（writer）** | **PC** | 組織状態を read-only で読み、§1.3 アイテムへ整形し、キュー JSON を**アトミック書き込み**(temp→`os.replace`)して LAN へ公開 | 組織状態が PC-local（事実） |
+| **consumer（reader）** | **DevKit** | キューを取得 → dedup → 逐語 `render` → `speak()` | ability の読み取り機構は §M3.1 で確認済（事実） |
+
+**推奨 transport（primary）: HTTP pull**
+- PC 側 exporter がキュー JSON を**アトミック書き込み**したうえで、PC 上の**最小 HTTP サーバ**で
+  静的配信する（例: `py -3 -m http.server` をキュー dir で、または極小 Flask）。
+- DevKit 上の ability が poll 毎に **HTTP GET** で取得し、既存の dedup/render/`speak()` に流す。
+- 同一サブネットのためレイテンシ・到達性は良好。サーバ停止/PC スリープ時は GET 失敗 →
+  その tick はスキップして次回リトライ（クラッシュしない）。
+
+**HTTP pull を推す理由**:
+1. DevKit（appliance OS）側に **SSH/共有マウント等の追加サービスを一切立てない**。受信面を増やさない。
+2. 「サーバ」負荷はすべて**我々が完全制御できる PC 側**に寄せられる。
+3. 完全性（atomicity）は**自然に担保**: HTTP は本体を完結受信できなければ GET 自体が失敗するため、
+   半端な内容を読むことがない（PC 側も `os.replace` で半端ファイルを配信しない二重防御）。
+
+**一方向性の担保（§3 の中核不変条件）**:
+- DevKit は **GET（受信）のみ**。PC へ **POST/PUT で書き戻さない**（経路を構造的に持たせない）。
+- 既読カーソルは DevKit 側ローカルで完結し、PC/組織状態を更新しない（副作用ゼロ, §3.2）。
+- コードレビュー観点に「on-device 経路から PC への送信メソッドを呼ばない」を追加する。
+
+**事実 / 要検証 の分離（最重要）**:
+- ✓ 事実: ability が**端末ローカルファイルを `open()` で読む**機構は §M3.1（稼働中 repo コード）で確認済。
+- ≈ 要検証: **ability プロセスが outbound LAN 通信（HTTP GET）を行えるか**は OpenHome 公式 doc に
+  明記がない（docs.openhome.com に Local/Background Ability のネットワーク権限の記載なし。
+  Python プロセスとしては技術的に可能だが、appliance の sandbox 制約は未確認）。M3 実機検証で確定する。
+- ≈ 要検証: ability とは別の**小さな fetch プロセス**を DevKit 上に常駐させ、取得結果を
+  ローカルファイルへ落として ability は従来どおり `open()` する、という分離案が取れるか
+  （OpenHome OS 上で ability 以外の常駐プロセスを動かせるか未確認）。
+
+**代替案（HTTP pull が取れない/不適な場合, いずれも 要検証）**:
+
+| 代替 | 仕組み | 長所 | 短所 / 要検証 |
+|------|--------|------|----------------|
+| **push: scp/rsync** | PC が DevKit へキューファイルを push、ability は従来どおり `open()` | ability に変更不要（読み取り機構そのまま） | DevKit で **sshd 有効化が必要**。OpenHome OS が SSH を開けるか未確認。受信面が増える |
+| **共有マウント (SMB/NFS)** | DevKit が PC 共有を mount、ability は mount パスを `open()` | ability に変更不要 | DevKit 側 **mount 設定が必要**（appliance OS で可能か未確認）。Wi-Fi mount の切断耐性に難 |
+| **MQTT 等の broker** | PC publish / DevKit subscribe | 疎結合・再送 | broker 追加運用。本件の最小要件に対し過剰 |
+
+> 推奨順位は **HTTP pull > push(scp) > 共有マウント > broker**。
+> 決め手は「**ロックダウンされた appliance（DevKit）側に新しい受信サービス/設定を足さない**」こと。
+> HTTP pull は DevKit に outbound 通信だけを求め、サーバ責務を完全制御下の PC へ寄せられるため
+> 最も単純かつ確実。ただし上記 ≈（ability の egress 可否）が実機検証の最初の確認項目。
 
 ### M3.4 デプロイ／エージェント作成（実測）
 
@@ -333,6 +390,60 @@ ability 側ローカルで永続（組織へ書き戻さない＝副作用ゼロ
 **実機での実音声 1 回**は物理工程（flash/接続/deploy/聴取）が要るため依頼者が手元 DevKit で
 実施（README の手順書に成功条件＝「逐語で聞こえる／再転写されない」を明記）。bridge 入力は
 M1 同様の**概念 notification dict**（public 衛生のため実 org state スキーマは写さない）。
+
+> 注: 実装済みコード経路は exporter/consumer を同一端末に置いた最小形。**本番の PC→DevKit
+> 配送**（exporter は PC 側）は §M3.3.1 を参照。consumer 側の読み取り機構は両者で不変。
+
+### M3.6 DevKit ハード／電源／接続要件（公式 doc 調査, Refs #7）
+
+実機検証（Issue #7）に向け、DevKit の電源・接続要件を公式一次情報で確定した。
+**凡例**: ✓ = 公式 doc で確認 / ≈ = 要検証。
+
+#### M3.6.1 DevKit のハード実体
+
+- ✓ OpenHome DevKit は**専用機ではなく Raspberry Pi ベース**。**Raspberry Pi Zero 2 W or higher**
+  に OpenHome の DevKit OS イメージを flash して使う
+  （[OpenHome blog: AI Raspberry Pi support](https://openhome.com/blog/ai-raspberry-pi-support) /
+  [Devkit Setup Guide](https://docs.openhome.com/devkit_setup_guide)）。
+- ✓ セットアップガイドの Raspberry Pi Imager 手順では **"Raspberry Pi Zero 2W"** を選択し、
+  OpenHome の custom image を書き込む（[Devkit Setup Guide](https://docs.openhome.com/devkit_setup_guide)）。
+  ⇒ **文書化された主対象は Zero 2 W**。
+- ≈ "or higher"（Pi 4 / Pi 5）でも動くかは blog の表現どまりで、OpenHome イメージの Pi 4/5
+  対応可否は公式に未確認（要検証）。電源仕様も後述のとおり Zero 2 W と異なる。
+
+#### M3.6.2 電源仕様（① 電源）
+
+- ✓ OpenHome 公式手順: 「**Connect your Raspberry Pi to a 2Amp minimum charger** and turn it on」
+  ＝ **2A 以上のチャージャー**で給電（[Devkit Setup Guide](https://docs.openhome.com/devkit_setup_guide)）。
+  あわせて **Raspberry Pi 推奨チャージャー**の使用を案内。
+- ✓ Zero 2 W のコネクタは **micro USB**。Raspberry Pi 公式の推奨電源は
+  **Raspberry Pi 12.5W Micro USB Power Supply = 出力 +5.1V DC / 2.5A / 12.5W**
+  （[RPi 12.5W micro USB PSU product brief](https://datasheets.raspberrypi.com/power-supply/micro-usb-power-supply-product-brief.pdf) /
+  [製品ページ](https://www.raspberrypi.com/products/micro-usb-power-supply/) /
+  [Pi Zero 2 W 製品ページ](https://www.raspberrypi.com/products/raspberry-pi-zero-2-w/)）。
+  ⇒ **推奨アダプタ: 5.1V/2.5A micro-USB（公式 12.5W PSU）。最低でも 2A**。
+- **PC 給電は不要・非推奨**: DevKit は**自前の AC アダプタ（micro-USB）で独立給電**する。
+  PC の USB から給電する前提は公式手順に無く、2A を満たさない PC ポートでは電圧降下の懸念。
+  ⇒ **PC からの給電に依存しない**（事実: 公式手順が AC チャージャー前提）。
+- ≈ Pi 4 / Pi 5 を使う場合はコネクタが **USB-C** に変わり、公式 PSU も Pi 4=5.1V/3A(15W)・
+  Pi 5=5.1V/5A(27W) と異なる。ただし前項のとおり OpenHome イメージの Pi 4/5 対応自体が要検証のため、
+  **Zero 2 W（micro-USB / 5.1V・2.5A）を基準**とする。
+
+#### M3.6.3 接続要件（② PC 接続要否・インターネット要否）
+
+- ✓ **インターネット接続は必須**。初回セットアップで DevKit が AP **`Openhome_MACADDRESS`** を
+  立て、そこに接続して **Wi-Fi 設定 + OpenHome アカウントでログイン**する
+  （[Devkit Setup Guide](https://docs.openhome.com/devkit_setup_guide)）。エージェントの LLM は
+  クラウド側のため、運用時もインターネット接続が前提。
+- ✓ **PC とのデータ接続は運用には不要**。PC が要るのは **SD カードへの image 書き込み（flash）時のみ**
+  （Raspberry Pi Imager。[Devkit Setup Guide](https://docs.openhome.com/devkit_setup_guide) /
+  [blog](https://openhome.com/blog/ai-raspberry-pi-support)）。flash 後の設定・操作は
+  **iOS アプリ / OpenHome Client と Wi-Fi 経由**で行い、PC への有線/USB データ接続は不要。
+- ✓ 音声 I/O: **USB マイク**（default input を `analog-mono`）＋ **Bluetooth スピーカー**（profile `a2dp-sink`）
+  （[Devkit Setup Guide](https://docs.openhome.com/devkit_setup_guide)）。
+- **本件固有の補足**: OpenHome 単体では PC 不要だが、**我々の連携は組織イベントが PC 上で発生する**ため、
+  運用上 PC↔DevKit の**アプリ層の経路**（§M3.3.1 の HTTP pull 等）が別途必要になる。
+  これは OpenHome の要件ではなく**本アーキテクチャの要件**である点に注意（混同しない）。
 
 ---
 
