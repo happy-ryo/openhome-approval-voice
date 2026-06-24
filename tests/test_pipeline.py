@@ -1,10 +1,21 @@
-"""Bridge + poller + ability data-path tests (design.md §1.2, §3.2)."""
+"""Bridge + poller + ability data-path tests (design.md §1.2, §3.2).
 
+M3.1: the pure logic no longer does file I/O or JSON itself (the ability does
+that via the storage API). These tests therefore simulate the storage hop with
+stdlib json — tests are not part of the deployed bundle, so they may use json.
+"""
+
+import json
 from pathlib import Path
 
 from approval_voice.ability import ApprovalVoiceAbility
-from approval_voice.bridge import export_queue, load_queue, notification_to_item
-from approval_voice.poller import ReadCursor, load_seen, save_seen
+from approval_voice.bridge import (
+    items_from_raw,
+    items_to_payload,
+    notification_to_item,
+    notifications_to_payload,
+)
+from approval_voice.poller import ReadCursor, seen_from_raw, seen_to_payload
 from approval_voice.schema import GATES, AnnounceItem
 
 
@@ -17,9 +28,10 @@ def _items():
     ]
 
 
-def test_example_queue_loads_and_covers_all_gates(tmp_path=None):
+def test_example_queue_loads_and_covers_all_gates():
     queue = Path(__file__).parent.parent / "examples" / "announce_queue.json"
-    items = load_queue(queue)
+    data = json.loads(queue.read_text(encoding="utf-8"))
+    items = items_from_raw(data)
     assert {i.gate for i in items} == set(GATES)
 
 
@@ -43,14 +55,22 @@ def test_bridge_is_public_hygiene_filter():
     assert item.id == "7"  # coerced to stable string
 
 
-def test_bridge_roundtrip(tmp_path):
+def test_queue_payload_roundtrips_through_storage_encoding():
+    # The ability encodes the payload (json.dumps -> write_file); the daemon reads
+    # it back (read_file -> json.loads -> items_from_raw). The pure logic only sees
+    # already-decoded dicts; simulate the storage encode/decode hop with stdlib.
     notifications = [
         {"id": "a", "gate": "worker_complete", "subject": "s", "options": ["承認"]},
     ]
-    out = tmp_path / "queue.json"
-    written = export_queue(notifications, out)
-    reread = load_queue(out)
-    assert [i.id for i in written] == [i.id for i in reread] == ["a"]
+    payload = notifications_to_payload(notifications)          # bridge: notif -> dicts
+    stored = json.dumps(payload, ensure_ascii=False)          # ability-side encode
+    reread = items_from_raw(json.loads(stored))               # daemon-side decode
+    assert [i.id for i in reread] == ["a"]
+
+
+def test_items_to_payload_is_inverse_of_items_from_raw():
+    items = _items()
+    assert [i.id for i in items_from_raw(items_to_payload(items))] == ["a", "b"]
 
 
 def test_cursor_dedups_within_batch():
@@ -78,29 +98,20 @@ def test_unknown_gate_rejected():
         AnnounceItem(id="x", gate="not_a_gate", title="t", question="q")
 
 
-def test_seen_cursor_persists_across_restart(tmp_path):
-    # M3: the on-device daemon restarts; a persisted cursor must suppress
-    # already-spoken gates so they are never re-read aloud.
-    seen_file = tmp_path / "nested" / "announce_seen.json"  # parent auto-created
-    assert load_seen(seen_file) == set()                    # missing -> empty
-
+def test_seen_cursor_payload_roundtrips_across_restart():
+    # M3: the on-device daemon restarts; a persisted cursor (seen_to_payload ->
+    # json -> write_file, restored read_file -> json -> seen_from_raw) must
+    # suppress already-spoken gates so they are never re-read aloud.
     cursor = ReadCursor()
     cursor.mark_read([AnnounceItem(id="a", gate="ci_merge", title="t", question="q")])
-    save_seen(seen_file, cursor)
-
-    assert load_seen(seen_file) == {"a"}
-
-
-def test_seen_cursor_corrupt_file_is_empty(tmp_path):
-    bad = tmp_path / "announce_seen.json"
-    bad.write_text("{not json", encoding="utf-8")
-    assert load_seen(bad) == set()  # corrupt cursor must not crash the daemon
+    stored = json.dumps(seen_to_payload(cursor))   # ability-side persist
+    restored = seen_from_raw(json.loads(stored))   # ability-side load on restart
+    assert restored == {"a"}
 
 
-def test_export_queue_is_atomic_and_roundtrips(tmp_path):
-    # Atomic write leaves no stray .tmp and yields a fully-parseable queue.
-    out = tmp_path / "announce_queue.json"
-    export_queue([{"id": "z", "gate": "escalation", "question": "q"}], out)
-    assert out.exists()
-    assert not (tmp_path / "announce_queue.json.tmp").exists()
-    assert [i.id for i in load_queue(out)] == ["z"]
+def test_seen_from_raw_is_defensive():
+    # A corrupt cursor payload must yield "nothing seen", never crash the daemon
+    # (the json-decode failure itself is caught in background.py).
+    assert seen_from_raw([]) == set()
+    assert seen_from_raw(None) == set()           # non-iterable -> empty
+    assert seen_from_raw(["a", 2]) == {"a", "2"}  # ids coerced to stable strings

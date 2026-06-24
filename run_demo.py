@@ -9,12 +9,13 @@ read-cursor suppresses already-spoken items (no double readout).
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from pathlib import Path
 
 from approval_voice.ability import ApprovalVoiceAbility
-from approval_voice.bridge import load_queue
+from approval_voice.bridge import items_from_raw
 
 QUEUE_PATH = Path(__file__).parent / "examples" / "announce_queue.json"
 
@@ -26,7 +27,9 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8")
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 
-    items = load_queue(QUEUE_PATH)
+    # The pure logic no longer reads files; load the demo queue with stdlib json
+    # (run_demo is a local dev tool, not part of the deployed bundle).
+    items = items_from_raw(json.loads(QUEUE_PATH.read_text(encoding="utf-8")))
     ability = ApprovalVoiceAbility()
 
     print(f"=== poll tick 1: {len(items)} item(s) in queue ===")

@@ -6,16 +6,18 @@ item. Read-cursor state is kept *locally* on the OpenHome side and is never
 written back to the org — reading aloud has zero side effect on org state
 (design.md §3.2).
 
-This is pure in-memory logic in M2; the real Ability persists `seen` via
-OpenHome `read_file()`/`write_file()` (design.md §4).
+M3.1 sandbox compliance (design.md §M3.1): module-scope data-encoding imports,
+low-level platform access and raw file access are rejected by the add-capability
+scan. So the poller stays **pure logic** with no file I/O and no data-encoding:
+the read-cursor's persistence (read/write) lives in the ability layer
+(`background.py`) via `capability_worker.read_file/write_file`, and the poller
+only converts a decoded list <-> internal state (`seen_from_raw` /
+`seen_to_payload`).
 """
 
 from __future__ import annotations
 
-import json
-import os
 from collections.abc import Iterable
-from pathlib import Path
 
 from .schema import AnnounceItem
 
@@ -50,30 +52,27 @@ class ReadCursor:
         return set(self._seen)
 
 
-def load_seen(path: str | Path) -> set[str]:
-    """Load the persisted read-cursor (set of spoken ids). Missing/corrupt -> empty.
+def seen_from_raw(data) -> set[str]:
+    """Build the seen-id set from an already-decoded cursor payload.
 
-    On-device the daemon restarts across sessions; persisting `seen` (M3) is what
-    keeps the real Ability from re-reading already-spoken gates. Kept here as a
-    pure file op so it is unit-tested without the OpenHome runtime.
+    The ability reads the cursor string via `capability_worker.read_file(...)`
+    and decodes it with a method-local JSON parse; this pure function turns the
+    decoded value into a set of string ids. Defensive on purpose: a malformed /
+    non-iterable payload yields an empty set so a corrupt cursor never crashes
+    the daemon (mirrors the old `load_seen` "corrupt -> nothing seen" guarantee;
+    the decode failure itself is caught in `background.py`).
     """
-    p = Path(path)
-    if not p.exists():
-        return set()
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
         return {str(x) for x in data}
-    except Exception:
-        # A corrupt cursor must not crash the daemon; treat as nothing-seen.
+    except TypeError:
         return set()
 
 
-def save_seen(path: str | Path, cursor: ReadCursor) -> None:
-    """Persist the read-cursor atomically (temp + os.replace) so a concurrent
-    reader never observes a half-written cursor file."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(sorted(cursor.seen), ensure_ascii=False, indent=2)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    os.replace(tmp, p)
+def seen_to_payload(cursor: ReadCursor) -> list[str]:
+    """Serialize the read-cursor into an encode-ready, stable-ordered id list.
+
+    The ability turns this into a string with a method-local JSON dump and
+    persists it via `capability_worker.write_file(...)`. Replaces the
+    file-writing half of the old `save_seen`.
+    """
+    return sorted(cursor.seen)

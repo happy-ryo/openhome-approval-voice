@@ -1,64 +1,53 @@
-"""approval-voice — on-device Background Ability (M3, real OpenHome).
+"""approval-voice — on-device Background Daemon ability (M3.1, sandbox compliant).
 
 This is the M3 *real* replacement for the M2 mock `ApprovalVoiceAbility`
-(approval_voice/ability.py). It is an OpenHome Background (always-on) Ability
-that runs on the DevKit, polls the shared announce queue, and reads each new
-`awaiting_user` gate aloud **verbatim** via `capability_worker.speak()`.
+(approval_voice/ability.py). It is an OpenHome Background Daemon ability that runs
+on the DevKit, polls a persistent storage file for the announce queue, and reads
+each new `awaiting_user` gate aloud **verbatim** via `capability_worker.speak()`.
 
 Grounded against a real shipped background ability
-(openhome-dev/abilities · community/alarm-timer/background.py): same imports,
-`# {{register capability}}` marker, `call(self, worker, background_daemon_mode)`
-signature, `session_tasks.create()` + `while True` + `session_tasks.sleep()`
-loop, and `send_interrupt_signal()` **once** before speaking.
+(openhome-dev/abilities · community/alarm-timer/background.py): same framework
+imports, `# {{register capability}}` marker, `call(self, worker,
+background_daemon_mode)` signature, `session_tasks.create()` + `while True` +
+`session_tasks.sleep()` loop, `send_interrupt_signal()` **once** before speaking,
+and persistence via the `capability_worker` storage API (`read_file` /
+`write_file` / `check_if_file_exists` / `delete_file`, all async, 2nd arg False).
 
-WHY (C) DevKit verbatim, not the cloud WebSocket (docs/design.md §M3): the
-cloud WS path (`wss://app.openhome.com/websocket/voice-stream/{KEY}/{AGENT_ID}`)
-treats sent text as *user speech* and the agent's LLM paraphrases a reply — it
-does NOT read the approval text verbatim. For an approval readout, paraphrase is
-a correctness risk. On-device `speak()` is direct TTS = verbatim.
+WHY (C) DevKit verbatim, not the cloud WebSocket (docs/design.md §M3): the cloud
+WS path treats sent text as *user speech* and the agent's LLM paraphrases a reply
+— it does NOT read the approval text verbatim. For an approval readout, paraphrase
+is a correctness risk. On-device `speak()` is direct TTS = verbatim.
 
 ONE-WAY GUARANTEE (design.md §3.1): output is `speak()` only. This module never
-calls `user_response()`, `run_io_loop()`, `run_confirmation_loop()`, or
-`start_audio_recording()` — `tests/test_one_way.py` AST-scans this folder too.
+captures user input — `tests/test_one_way.py` AST-scans this folder too.
 `send_interrupt_signal()` before speaking also *prevents the daemon's own speech
 from being transcribed back as user input* (per OpenHome background-abilities
 docs) — a second structural guard for the one-way property.
 
-The queue is read **read-only** (plain `open()`, the documented Local-Ability FS
-pattern). The read-cursor is persisted to a *separate local* file on the device;
-nothing is ever written back to the org (design.md §3.2 — zero side effect on
-org state).
+M3.1 sandbox compliance (design.md §M3.1): the OpenHome add-capability static scan
+rejects low-level platform access, module-scope data-encoding imports, raw file
+access and low-level signal handling. So:
+  - file coordination uses the **storage-name-based async `capability_worker`
+    API** (no file paths, no raw file access; design.md §M3.1);
+  - data encoding is imported **inside method bodies**, not at module scope;
+  - the pure-logic `approval_voice` package is resolved by **relative import**
+    (`from .approval_voice...`) with no execution-path rewriting. The ability
+    bundle is loaded as a package (wrap folder), so a bundled sub-package resolves
+    via relative import — proven by openhome-dev/abilities ·
+    dungeon-master-voice's `from .dm_personalities`.
 """
 
 from __future__ import annotations
-
-import os
-import sys
-
-# The deploy bundle places the pure-logic `approval_voice` package next to this
-# ability (see README deploy step) so the single source of truth for rendering /
-# schema / dedup is reused, not duplicated (design.md §5).
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.agent.capability import MatchingCapability
 from src.agent.capability_worker import CapabilityWorker
 from src.main import AgentWorker
 
-from approval_voice.bridge import load_queue
-from approval_voice.poller import ReadCursor, load_seen, save_seen
-from approval_voice.renderer import render_speech
-
-# Transport (design.md §M3, Q2): a fixed local JSON file on the device, written
-# atomically by the bridge and read here via plain open(). Paths/interval are
-# env-configurable; defaults live under the user's OpenHome data dir.
-_DEFAULT_DIR = os.path.join(os.path.expanduser("~"), ".openhome", "approval_voice")
-QUEUE_PATH = os.environ.get(
-    "APPROVAL_VOICE_QUEUE", os.path.join(_DEFAULT_DIR, "announce_queue.json")
-)
-SEEN_PATH = os.environ.get(
-    "APPROVAL_VOICE_SEEN", os.path.join(_DEFAULT_DIR, "announce_seen.json")
-)
-POLL_SECONDS = float(os.environ.get("APPROVAL_VOICE_POLL_SECONDS", "15"))
+# Resolve the bundled pure logic (single source of truth) by relative import.
+from .approval_voice.bridge import items_from_raw
+from .approval_voice.poller import ReadCursor, seen_from_raw, seen_to_payload
+from .approval_voice.renderer import render_speech
+from .approval_voice.storage import POLL_SECONDS, QUEUE_STORE, SEEN_STORE
 
 
 class ApprovalVoiceWatcher(MatchingCapability):
@@ -68,6 +57,30 @@ class ApprovalVoiceWatcher(MatchingCapability):
 
     # Do not change following tag of register capability
     # {{register capability}}
+
+    async def _load_seen(self) -> set:
+        """Load the persisted read-cursor from storage (missing/corrupt -> empty)."""
+        # method-local import: a module-scope encode import is banned by the sandbox.
+        import json
+
+        if not await self.capability_worker.check_if_file_exists(SEEN_STORE, False):
+            return set()
+        try:
+            raw = await self.capability_worker.read_file(SEEN_STORE, False)
+            return seen_from_raw(json.loads(raw))
+        except Exception:
+            # A corrupt cursor must not crash the daemon; treat as nothing-seen.
+            return set()
+
+    async def _save_seen(self, cursor: ReadCursor) -> None:
+        """Persist the read-cursor (delete-then-write, the documented OpenHome
+        pattern that avoids a half-written / appended cursor file)."""
+        import json
+
+        payload = json.dumps(seen_to_payload(cursor), ensure_ascii=False, indent=2)
+        if await self.capability_worker.check_if_file_exists(SEEN_STORE, False):
+            await self.capability_worker.delete_file(SEEN_STORE, False)
+        await self.capability_worker.write_file(SEEN_STORE, payload, False)
 
     async def _read_aloud(self, fresh: list) -> None:
         """Verbatim readout of new gates. Interrupt ONCE, then speak each."""
@@ -79,15 +92,18 @@ class ApprovalVoiceWatcher(MatchingCapability):
 
     async def watch_queue(self) -> None:
         """Infinite poll loop: detect unread gates -> verbatim readout. Read-only."""
+        import json
+
         self.worker.editor_logging_handler.info(
-            "[ApprovalVoice] background.py ACTIVE — polling %s every %ss"
-            % (QUEUE_PATH, POLL_SECONDS)
+            "[ApprovalVoice] background.py ACTIVE — polling storage %s every %ss"
+            % (QUEUE_STORE, POLL_SECONDS)
         )
         while True:
             try:
-                if os.path.exists(QUEUE_PATH):
-                    items = load_queue(QUEUE_PATH)               # read-only
-                    cursor = ReadCursor(load_seen(SEEN_PATH))    # local cursor
+                if await self.capability_worker.check_if_file_exists(QUEUE_STORE, False):
+                    raw = await self.capability_worker.read_file(QUEUE_STORE, False)
+                    items = items_from_raw(json.loads(raw))      # read-only
+                    cursor = ReadCursor(await self._load_seen())  # local cursor
                     fresh = cursor.unread(items)
                     if fresh:
                         self.worker.editor_logging_handler.info(
@@ -95,7 +111,7 @@ class ApprovalVoiceWatcher(MatchingCapability):
                         )
                         await self._read_aloud(fresh)
                         cursor.mark_read(fresh)
-                        save_seen(SEEN_PATH, cursor)             # persist locally
+                        await self._save_seen(cursor)             # persist locally
             except Exception as e:  # never let one bad tick kill the daemon
                 self.worker.editor_logging_handler.info(
                     "[ApprovalVoice] poll error: %s" % e
