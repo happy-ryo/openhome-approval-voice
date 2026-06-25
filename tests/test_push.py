@@ -9,8 +9,11 @@ paramiko is NOT exercised here: the SSH transport is covered structurally by the
 LocalTransport (same Transport surface) plus a FlakyTransport for backoff; a real
 SFTP round-trip needs a live sshd and is the user's on-device step.
 """
+import argparse
+
 import pytest
 
+import pc_exporter.__main__ as cli
 from pc_exporter.push import (
     LocalTransport,
     PushState,
@@ -151,3 +154,62 @@ def test_push_with_backoff_raises_after_exhausting_attempts(tmp_path):
             attempts=3, base_delay=1.0, max_delay=4.0, sleep=delays.append)
     assert transport.calls == 3            # exactly `attempts` tries
     assert delays == [1.0, 2.0]            # slept between tries, not after the last
+
+
+# --- loop reconnect on dropped connection (regression: codex P2) ----------
+class _DeadAfterConnectTransport:
+    """Connects fine, but every push raises -- models a dropped SFTP channel."""
+
+    def remote_size(self, remote_path):
+        return None
+
+    def put_atomic(self, local_path, remote_path):
+        raise OSError("connection lost (simulated DevKit reboot)")
+
+    def close(self):
+        pass
+
+
+def test_push_loop_reconnects_after_a_dropped_round(tmp_path, monkeypatch):
+    # A long-running `push` loop must NOT wedge on a dead transport: paramiko
+    # won't reopen a closed channel, so a failed round has to drop + rebuild it.
+    # We count make_transport() calls: the up-front connect plus at least one
+    # reconnect after the first round's push fails.
+    out = tmp_path / "announce_queue.json"
+
+    connects = {"n": 0}
+
+    def _fake_make_transport(target, **kw):
+        connects["n"] += 1
+        return _DeadAfterConnectTransport()
+
+    def _fake_export(db_path, out_path, since=None, limit=None):
+        out_path = tmp_path / "announce_queue.json"
+        out_path.write_text("[]", encoding="utf-8")
+        return 0
+
+    class _StopLoop(Exception):
+        pass
+
+    sleeps = {"n": 0}
+
+    def _fake_sleep(_seconds):
+        sleeps["n"] += 1
+        if sleeps["n"] >= 2:            # let two rounds run, then break out
+            raise _StopLoop
+
+    monkeypatch.setattr(cli, "make_transport", _fake_make_transport)
+    monkeypatch.setattr(cli, "export_queue", _fake_export)
+    monkeypatch.setattr(cli.time, "sleep", _fake_sleep)
+
+    args = argparse.Namespace(
+        db_path="dummy.db", out=str(out), since=None, limit=None,
+        target="user@devkit:/data/announce_queue.json", port=22, identity=None,
+        interval=0.0, attempts=1, once=False,
+    )
+
+    with pytest.raises(_StopLoop):
+        cli._cmd_push(args)
+
+    # 1 up-front connect + >=1 reconnect after the first failed round.
+    assert connects["n"] >= 2

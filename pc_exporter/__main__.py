@@ -136,6 +136,10 @@ def _cmd_push(args: argparse.Namespace) -> int:
     if not target.is_local:
         if args.identity:
             ssh_kwargs["key_filename"] = args.identity
+
+    # Connect once up front so a real misconfig (bad host/key/missing paramiko)
+    # fails fast with a clear exit code, rather than being retried forever as if
+    # it were a transient blip.
     try:
         transport = make_transport(target, **ssh_kwargs)
     except Exception as exc:  # noqa: BLE001 - connect / missing paramiko
@@ -152,9 +156,29 @@ def _cmd_push(args: argparse.Namespace) -> int:
         # ASCII only (queue values are never logged here).
         print(msg)
 
+    # Holder so a failed round can drop a dead connection and the next round can
+    # rebuild it. paramiko does NOT auto-reopen a closed SFTP channel, so a DevKit
+    # reboot / Wi-Fi drop would otherwise wedge the loop on a dead transport
+    # forever. `None` means "reconnect before the next push".
+    holder = {"transport": transport}
+
+    def _ensure_transport():
+        if holder["transport"] is None:
+            holder["transport"] = make_transport(target, **ssh_kwargs)
+        return holder["transport"]
+
+    def _drop_transport() -> None:
+        t = holder["transport"]
+        holder["transport"] = None
+        if t is not None:
+            try:
+                t.close()
+            except Exception:  # noqa: BLE001 - already-dead channel close is moot
+                pass
+
     def _one_round() -> None:
         export_queue(db_path, out_path, since=since, limit=limit)
-        push_with_backoff(out_path, target.path, transport, state,
+        push_with_backoff(out_path, target.path, _ensure_transport(), state,
                           attempts=args.attempts, log=_log)
 
     try:
@@ -165,14 +189,17 @@ def _cmd_push(args: argparse.Namespace) -> int:
             try:
                 _one_round()
             except Exception as exc:  # noqa: BLE001 - keep looping on a bad round
-                print("push round failed (will retry next interval): %s" % exc,
+                # The connection may be dead (reboot/Wi-Fi); drop it so the next
+                # round reconnects instead of reusing a closed channel forever.
+                _drop_transport()
+                print("push round failed (will reconnect next interval): %s" % exc,
                       file=sys.stderr)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("shutting down")
         return 0
     finally:
-        transport.close()
+        _drop_transport()
 
 
 def build_parser() -> argparse.ArgumentParser:
