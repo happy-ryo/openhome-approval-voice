@@ -71,11 +71,16 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     interval = args.interval
     since, limit = args.since, args.limit
 
-    # Export once up front so the file exists before the socket binds.
+    # Export once up front so the file exists before the socket binds. A failure
+    # HERE is a startup misconfiguration (bad --db-path, unreadable DB): fail
+    # fast rather than binding and serving stale previous-run data (or a silent
+    # []). The re-export loop below stays resilient to *transient* mid-run
+    # failures (a brief lock / DB swap) once a good initial export has happened.
     try:
         export_queue(db_path, out_path, since=since, limit=limit)
     except Exception as exc:  # noqa: BLE001
-        print("initial export failed: %s" % exc, file=sys.stderr)
+        print("initial export failed (not serving): %s" % exc, file=sys.stderr)
+        return 2
 
     stop = threading.Event()
 
