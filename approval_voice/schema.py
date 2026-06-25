@@ -29,6 +29,14 @@ GATES = (
 )
 
 
+# Explicit field-name list used by from_dict(). We do NOT introspect the dataclass
+# field map via dunder attribute access: the OpenHome add-capability sandbox rejects
+# dunder attribute access (e.g. `cls.<field-map>`) as a suspicious introspection
+# escape (design.md §M3.1-sandbox). tests/test_schema.py asserts this stays in sync
+# with the dataclass fields, so a new field can't silently desync from_dict.
+ITEM_FIELDS = ("id", "gate", "title", "question", "subject", "options", "created_at")
+
+
 @dataclass
 class AnnounceItem:
     """One "waiting decision" to be read aloud. Maps 1:1 to a queue entry."""
@@ -49,7 +57,7 @@ class AnnounceItem:
 
     @classmethod
     def from_dict(cls, data: dict) -> "AnnounceItem":
-        known = {f: data[f] for f in cls.__dataclass_fields__ if f in data}
+        known = {f: data[f] for f in ITEM_FIELDS if f in data}
         return cls(**known)
 
     def to_dict(self) -> dict:

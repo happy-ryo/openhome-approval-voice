@@ -15,6 +15,10 @@ Rule sources (grounded, design.md §M3.1):
 - openhome-dev/abilities `validate_ability.py` (the repo PR validator) regex set:
   raw `open(`, `print(`, `assert`, `asyncio.sleep(`/`asyncio.create_task(`,
   `exec(`/`eval(`, `pickle.`/`dill.`/`shelve.`/`marshal.`, `hashlib.md5(`.
+- add-capability server response (observed on a real upload): "Suspicious dunder
+  attribute access" — any `expr.__name__` attribute access (introspection escape).
+  Reproduced AST-side below (`_dunder_violations`); dunder method defs / imports /
+  `__all__` are NOT attribute access and stay allowed.
 
 We enforce the UNION so the bundle passes either scanner. The scan is run over
 raw source (comments + docstrings included) on purpose: the SDK reference notes
@@ -61,8 +65,39 @@ _RULES: list[tuple[re.Pattern, str]] = [
 ]
 
 
+# Dunder rule (server-side add-capability): "Suspicious dunder attribute access".
+# The real scan is AST-based on the access form `expr.__name__` (and getattr-family
+# with a dunder string), NOT on dunder method *definitions* (`def __init__` /
+# `def __post_init__`), the `from __future__` import, or a module-level `__all__`
+# assignment — those are not attribute access and shipped abilities rely on them.
+# No allowlist is needed: the bundle has zero legitimate dunder attribute access.
+_DUNDER_RE = re.compile(r"^__\w+__$")
+_GETATTR_FAMILY = {"getattr", "setattr", "hasattr", "delattr"}
+
+
 def _lineno(text: str, pos: int) -> int:
     return text.count("\n", 0, pos) + 1
+
+
+def _dunder_violations(text: str, rel: str) -> list[str]:
+    """Flag dunder *attribute access* (`expr.__x__`, getattr(obj, '__x__'))."""
+    out: list[str] = []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return out  # syntax error already surfaced by the json/AST check
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and _DUNDER_RE.match(node.attr):
+            out.append(f"{rel}:{node.lineno}: suspicious dunder attribute access "
+                       f".{node.attr} (forbidden introspection escape)")
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+              and node.func.id in _GETATTR_FAMILY):
+            for arg in node.args:
+                if (isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                        and _DUNDER_RE.match(arg.value)):
+                    out.append(f"{rel}:{node.lineno}: suspicious dunder access "
+                               f"{node.func.id}(..., {arg.value!r})")
+    return out
 
 
 def _toplevel_json_violations(text: str, rel: str) -> list[str]:
@@ -92,6 +127,7 @@ def scan_text(text: str, rel: str) -> list[str]:
         for m in pattern.finditer(text):
             violations.append(f"{rel}:{_lineno(text, m.start())}: {message}")
     violations.extend(_toplevel_json_violations(text, rel))
+    violations.extend(_dunder_violations(text, rel))
     return violations
 
 

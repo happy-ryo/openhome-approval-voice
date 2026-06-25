@@ -44,3 +44,27 @@ def test_linter_actually_flags_known_violations():
 
     method_local = "def f():\n    import json\n    return json.loads('[]')\n"
     assert scan_text(method_local, "ok.py") == []  # method-local json is allowed
+
+
+def test_linter_flags_dunder_attribute_access():
+    # The server-side add-capability scan rejects dunder attribute access as a
+    # suspicious introspection escape (this regression was a real upload failure:
+    # cls.__dataclass_fields__). The linter must catch the access form...
+    assert any(
+        "dunder attribute access" in v for v in scan_text("x = cls.__dataclass_fields__\n", "d.py")
+    )
+    assert any("dunder attribute access" in v for v in scan_text("y = o.__class__\n", "d.py"))
+    assert any("dunder access" in v for v in scan_text("getattr(o, '__globals__')\n", "g.py"))
+
+    # ...but NOT dunder method definitions / __future__ import / __all__ assignment,
+    # which are not attribute access and are used by shipped abilities.
+    allowed = (
+        "from __future__ import annotations\n"
+        "__all__ = ['C']\n"
+        "class C:\n"
+        "    def __init__(self):\n"
+        "        self.value = 1\n"
+        "    def __post_init__(self):\n"
+        "        return self.value\n"
+    )
+    assert scan_text(allowed, "ok.py") == []
