@@ -16,8 +16,6 @@ one **single source of truth** and cannot drift apart.
 > its own names) — the same app-specific role speak.py / ability.py already play.
 """
 
-from __future__ import annotations
-
 # Read-aloud queue (a JSON array of §1.3 items).
 QUEUE_STORE = "announce_queue.json"
 

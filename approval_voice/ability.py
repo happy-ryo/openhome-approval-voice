@@ -13,8 +13,6 @@ or `start_audio_recording()`. After reading aloud it returns straight to the
 poll loop and never enters an interactive/confirmation state.
 """
 
-from __future__ import annotations
-
 from collections.abc import Callable
 
 from .poller import ReadCursor
@@ -29,7 +27,7 @@ class ApprovalVoiceAbility:
     def __init__(
         self,
         speak_fn: Callable[[str], str] = speak,
-        cursor: ReadCursor | None = None,
+        cursor: "ReadCursor | None" = None,
     ) -> None:
         self._speak = speak_fn
         self._cursor = cursor or ReadCursor()

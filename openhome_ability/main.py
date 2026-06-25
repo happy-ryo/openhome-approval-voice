@@ -17,8 +17,6 @@ relative import; no low-level platform access, no module-scope data-encoding
 import, no raw file access (design.md §M3.1-sandbox).
 """
 
-from __future__ import annotations
-
 from src.agent.capability import MatchingCapability
 from src.agent.capability_worker import CapabilityWorker
 from src.main import AgentWorker

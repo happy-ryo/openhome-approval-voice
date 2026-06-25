@@ -593,6 +593,29 @@ add-capability は禁止モジュールの **import** を `{"detail":"Forbidden 
 - **未知の禁止パターンが残存する可能性**: サーバ sandbox 仕様が非公開のため、別レイヤ（禁止
   module / dunder / 静的パターン）でさらに発見されうる。発見ごとに対応レイヤへ denylist 追加する。
 
+### M3.1-s.8 `from __future__` 禁止と annotation の runtime 安全化（Refs #11, 5th round）
+
+実機 runtime 起動時に Python load error:
+`from __future__ imports must occur at the beginning of the file (background.py, line 60)`。
+だが **ローカル `py_compile` は通る**（ファイル内では docstring 直後の正しい位置）。原因は
+**OpenHome ローダが ability ファイル先頭に自前コードを prepend** してロードするため、
+正しく置いた `from __future__` も結果的に「先頭でない」位置へ押し下げられ PEP 236 違反になる。
+稼働 ability（alarm-timer / dungeon-master）も `from __future__` を使っていない。
+
+→ **対処**: バンドル全 .py から **`from __future__ import annotations` を撤去**。これにより
+annotation が **import 時に評価される**ため、runtime 安全な形にする:
+- **PEP 604 の `X | None`**（3.10+）は **文字列化**（`"Iterable[str] | None"` 等）して評価を回避
+  （`poller.py` / `ability.py` の 2 箇所）。
+- 添字付き builtin generics `list[str]` / `set[str]` / `Callable[...]`（PEP 585, 3.9+）は据え置き
+  （DevKit の Raspberry Pi OS は Bullseye=3.9 / Bookworm=3.11 で 3.9+ のため安全）。
+- function-local 変数 annotation は評価されないので対象外。
+- 予防: `sandbox_lint.py` に **`from __future__ import` を AST で禁止**するルールを追加
+  （loader prepend で壊れる旨のメッセージ付き）。今後 instrumentation 追加時の再発を防ぐ。
+
+> 教訓: ability ファイルは「素のまま実行される」のではなく **ローダが変形（prepend）する**前提で
+> 書く。`from __future__` のような「ファイル先頭限定」構文は使わない。`py_compile` が通っても
+> runtime で別の load error が出るのはこのため。
+
 ---
 
 ## 付録: 参照

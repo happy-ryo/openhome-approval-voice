@@ -164,7 +164,16 @@ def _forbidden_module_violations(text: str, rel: str) -> list[str]:
                                f"'{alias.name}' (debug/introspection/unsafe — denylisted)")
         elif isinstance(node, ast.ImportFrom):
             top = (node.module or "").split(".")[0]
-            if node.level == 0 and top in _FORBIDDEN_IMPORT_MODULES:
+            if node.module == "__future__":
+                # The OpenHome loader prepends code to the ability file at load
+                # time, so even a correctly-placed `from __future__` ends up after
+                # other statements -> "from __future__ imports must occur at the
+                # beginning of the file". Forbid it; make annotations runtime-safe
+                # (quote PEP-604 `X | None`) instead. Shipped abilities omit it.
+                out.append(f"{rel}:{node.lineno}: `from __future__ import` is not "
+                           "allowed (loader prepends code, breaking __future__ "
+                           "placement — remove it; quote PEP-604 annotations)")
+            elif node.level == 0 and top in _FORBIDDEN_IMPORT_MODULES:
                 out.append(f"{rel}:{node.lineno}: forbidden module import "
                            f"'from {node.module}' (debug/introspection/unsafe — denylisted)")
     return out

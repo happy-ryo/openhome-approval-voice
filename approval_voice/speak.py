@@ -10,8 +10,6 @@ is output-only. It must never reference voice-INPUT APIs
 `start_audio_recording`). `tests/test_one_way.py` enforces this statically.
 """
 
-from __future__ import annotations
-
 import logging
 
 logger = logging.getLogger("approval_voice.speak")

@@ -15,8 +15,6 @@ only converts a decoded list <-> internal state (`seen_from_raw` /
 `seen_to_payload`).
 """
 
-from __future__ import annotations
-
 from collections.abc import Iterable
 
 from .schema import AnnounceItem
@@ -25,7 +23,7 @@ from .schema import AnnounceItem
 class ReadCursor:
     """Tracks spoken item ids; yields only fresh items, in order."""
 
-    def __init__(self, seen: Iterable[str] | None = None) -> None:
+    def __init__(self, seen: "Iterable[str] | None" = None) -> None:
         self._seen: set[str] = set(seen or ())
 
     def unread(self, items: list[AnnounceItem]) -> list[AnnounceItem]:

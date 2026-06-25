@@ -45,8 +45,6 @@ access and low-level signal handling. So:
     dungeon-master-voice's `from .dm_personalities`.
 """
 
-from __future__ import annotations
-
 from src.agent.capability import MatchingCapability
 from src.agent.capability_worker import CapabilityWorker
 from src.main import AgentWorker

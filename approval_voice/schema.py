@@ -11,8 +11,6 @@ org state schema, internal identifiers, machine paths, or hook names belong
 in an AnnounceItem.
 """
 
-from __future__ import annotations
-
 from dataclasses import asdict, dataclass, field
 
 # The four awaiting_user gates the Secretary stops on (design.md §2).

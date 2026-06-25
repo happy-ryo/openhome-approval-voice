@@ -22,8 +22,6 @@ app-specific role storage.py / speak.py play — not shared sister-project logic
 It is pure data (no file I/O, no encoding), so it stays sandbox-clean.
 """
 
-from __future__ import annotations
-
 # Smoke autoseed switch. True for the M3.1 on-device smoke; Issue #7 sets False.
 SMOKE_AUTOSEED = True
 

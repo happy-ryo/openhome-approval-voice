@@ -56,10 +56,10 @@ def test_linter_flags_dunder_attribute_access():
     assert any("dunder attribute access" in v for v in scan_text("y = o.__class__\n", "d.py"))
     assert any("dunder access" in v for v in scan_text("getattr(o, '__globals__')\n", "g.py"))
 
-    # ...but NOT dunder method definitions / __future__ import / __all__ assignment,
-    # which are not attribute access and are used by shipped abilities.
+    # ...but NOT dunder method definitions / __all__ assignment, which are not
+    # attribute access. (`from __future__` is forbidden by a separate rule, so it
+    # is intentionally excluded here.)
     allowed = (
-        "from __future__ import annotations\n"
         "__all__ = ['C']\n"
         "class C:\n"
         "    def __init__(self):\n"
@@ -96,3 +96,14 @@ def test_linter_flags_forbidden_module_imports():
         "def f():\n    import json\n    return json.loads('[]')\n"
     )
     assert scan_text(ok, "ok.py") == []
+
+
+def test_linter_flags_from_future_import():
+    # The OpenHome loader prepends code at load time, so even a correctly-placed
+    # `from __future__ import annotations` ends up after other statements and the
+    # runtime raises "from __future__ imports must occur at the beginning of the
+    # file". Forbid it outright (shipped abilities omit it).
+    assert any(
+        "__future__" in v
+        for v in scan_text("from __future__ import annotations\n", "f.py")
+    )

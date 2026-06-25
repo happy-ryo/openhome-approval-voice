@@ -22,8 +22,6 @@ claude-org state schema (public hygiene). M3 replaces this input with a real,
 read-only export from live state.
 """
 
-from __future__ import annotations
-
 from .schema import AnnounceItem
 
 

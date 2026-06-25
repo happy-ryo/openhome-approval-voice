@@ -11,8 +11,6 @@ Design rules enforced here (§2):
   reply goes through the terminal, not the voice channel.
 """
 
-from __future__ import annotations
-
 from .schema import (
     GATE_CI_MERGE,
     GATE_ESCALATION,
