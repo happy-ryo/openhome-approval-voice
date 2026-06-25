@@ -138,16 +138,47 @@ class _FakeLog:
         pass
 
 
+class _StopLoop(Exception):
+    """Raised from the patched sleep to break watch_queue's infinite loop."""
+
+
+class _FakeSessionTasks:
+    """Lets watch_queue run exactly `ticks` iterations, then stops the loop."""
+
+    def __init__(self, ticks=1):
+        self._remaining = ticks
+
+    async def sleep(self, _seconds):
+        self._remaining -= 1
+        if self._remaining <= 0:
+            raise _StopLoop
+
+    def create(self, coro):
+        coro.close()  # we drive watch_queue directly; don't schedule it twice
+
+
 class _FakeWorker:
-    def __init__(self):
+    def __init__(self, ticks=1):
         self.editor_logging_handler = _FakeLog()
+        self.session_tasks = _FakeSessionTasks(ticks)
 
 
-def _make_watcher():
+def _make_watcher(ticks=1):
     w = background.ApprovalVoiceWatcher()
-    w.worker = _FakeWorker()
+    w.worker = _FakeWorker(ticks)
     w.capability_worker = _FakeCapabilityWorker()
     return w
+
+
+def _run_watch_queue(watcher):
+    """Drive the REAL watch_queue loop for `ticks` iterations (then _StopLoop)."""
+    async def scenario():
+        try:
+            await watcher.watch_queue()
+        except _StopLoop:
+            pass
+
+    asyncio.run(scenario())
 
 
 def _seed_five_gate_db(db: Path) -> None:
@@ -264,3 +295,44 @@ def test_push_loopback_idempotent_redelivery_then_new_gate(tmp_path):
     assert len(spoken) == 2                         # the new gate, spoken once
     assert "Issue #9" in spoken[1]
     assert watcher.capability_worker.interrupts == 2  # one interrupt per readout batch
+
+
+def test_watch_queue_reads_pushed_storage_no_network(tmp_path):
+    # Drive the REAL daemon entry (watch_queue), not just _drain_queue_once: with
+    # SMOKE_AUTOSEED off the loop must read whatever the PC pushed into QUEUE_STORE
+    # and NOT touch the network (the storage-only reader contract). This is the
+    # coverage the deleted test_live_pull.py used to give the loop body.
+    db = tmp_path / "state.db"
+    _seed_five_gate_db(db)
+    local_queue = tmp_path / "announce_queue.json"
+    core.export_queue(db, local_queue)
+
+    watcher = _make_watcher(ticks=1)
+    # Simulate the PC push already having landed the file in the ability storage.
+    watcher.capability_worker.storage[QUEUE_STORE] = local_queue.read_text(encoding="utf-8")
+
+    assert background.SMOKE_AUTOSEED is False     # production default (no self-seed)
+    _run_watch_queue(watcher)
+
+    cw = watcher.capability_worker
+    assert len(cw.spoken) == 5                    # all 5 folded gates read aloud
+    assert all(line.endswith(ONE_WAY_SUFFIX) for line in cw.spoken)
+    assert cw.interrupts == 1                      # interrupt once before the batch
+
+
+def test_watch_queue_self_seeds_when_smoke_autoseed_on(tmp_path, monkeypatch):
+    # The trigger-free on-device smoke path: with SMOKE_AUTOSEED True the daemon
+    # seeds the 4-gate sample into its own storage on startup and reads it -- no
+    # push, no network, no trigger. Pins the self-seed branch of watch_queue.
+    monkeypatch.setattr(background, "SMOKE_AUTOSEED", True)
+
+    watcher = _make_watcher(ticks=1)
+    assert QUEUE_STORE not in watcher.capability_worker.storage  # empty at start
+    _run_watch_queue(watcher)
+
+    cw = watcher.capability_worker
+    assert QUEUE_STORE in cw.storage              # self-seeded its own storage
+    import json
+    assert {i["gate"] for i in json.loads(cw.storage[QUEUE_STORE])} == set(GATES)
+    assert len(cw.spoken) == 4                    # canonical 4-gate sample read aloud
+    assert cw.interrupts == 1

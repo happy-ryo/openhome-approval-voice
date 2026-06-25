@@ -1,11 +1,16 @@
-"""Structurally guarantee the outbound pull stays one-way (design.md §3.1 / §M3.3.1).
+"""Structurally guarantee the on-device ability has no write-back path (design.md §3.1 / §M3.3.1).
 
-The live PC->DevKit transport lets the on-device ability make outbound HTTP — but
-it must only ever **GET** (receive). It must never send a body back to the PC.
-`urllib.request.urlopen(url)` / `Request(url)` are GETs; the moment either carries
-a `data=` argument they become POSTs, and any `.post(`/`.put(`/`.patch(` call is a
-write-back. We AST-scan the deployable ability so this can never regress into a
-return channel — the network sibling of `tests/test_one_way.py`.
+The production transport is a PC-side push: the ability is a storage-only reader
+and makes NO network call at all (the earlier outbound GET was removed because
+`urllib` is sandbox-denylisted). This guard pins that invariant against
+regression — should anyone re-add an outbound channel (a requests-based pull, a
+raw `urlopen`, etc.), it must still only ever **GET** (receive) and never send a
+body back to the PC. `urllib.request.urlopen(url)` / `Request(url)` are GETs; the
+moment either carries a `data=` argument they become POSTs, and any
+`.post(`/`.put(`/`.patch(` call is a write-back. We AST-scan the deployable
+ability so a return channel can never creep in — the network sibling of
+`tests/test_one_way.py`. (Today the bundle has zero such calls, so this passes
+vacuously; it earns its keep the moment an outbound transport is reintroduced.)
 """
 
 import ast

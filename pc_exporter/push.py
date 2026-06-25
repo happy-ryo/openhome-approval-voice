@@ -265,12 +265,11 @@ class PushState:
     """Carried across push attempts so a steady state is not re-pushed.
 
     ``last_digest`` is the content digest of the bytes last successfully
-    delivered; ``last_size`` is their byte length (used to detect a remote that
-    was wiped and now mismatches). Construct fresh per run.
+    delivered; a re-export with a matching digest is not re-pushed (unless the
+    remote is gone/mismatched -- see :func:`push_once`). Construct fresh per run.
     """
 
     last_digest: Optional[str] = None
-    last_size: Optional[int] = None
 
 
 def push_once(
@@ -300,7 +299,6 @@ def push_once(
             log("push: content unchanged but remote missing/mismatched -> re-push")
     transport.put_atomic(local_path, remote_path)
     state.last_digest = digest
-    state.last_size = size
     if log:
         log("push: delivered %d bytes to remote" % size)
     return True
