@@ -67,6 +67,12 @@ class ApprovalVoiceWatcher(MatchingCapability):
     # Do not change following tag of register capability
     # {{register capability}}
 
+    def _log(self, msg: str) -> None:
+        """Route a diagnostic line to the OpenHome editor log (Open In Editor ->
+        log tab). Verbose on purpose for the M3.1 on-device bring-up (Refs #11);
+        trim once the readout is confirmed on hardware."""
+        self.worker.editor_logging_handler.info("[ApprovalVoice] %s" % msg)
+
     async def _load_seen(self) -> set:
         """Load the persisted read-cursor from storage (missing/corrupt -> empty)."""
         # method-local import: a module-scope encode import is banned by the sandbox.
@@ -77,8 +83,11 @@ class ApprovalVoiceWatcher(MatchingCapability):
         try:
             raw = await self.capability_worker.read_file(SEEN_STORE, False)
             return seen_from_raw(json.loads(raw))
-        except Exception:
+        except Exception as e:
             # A corrupt cursor must not crash the daemon; treat as nothing-seen.
+            import traceback
+            self._log("load_seen error (treating as empty): %s\n%s"
+                      % (e, traceback.format_exc()))
             return set()
 
     async def _save_seen(self, cursor: ReadCursor) -> None:
@@ -90,6 +99,7 @@ class ApprovalVoiceWatcher(MatchingCapability):
         if await self.capability_worker.check_if_file_exists(SEEN_STORE, False):
             await self.capability_worker.delete_file(SEEN_STORE, False)
         await self.capability_worker.write_file(SEEN_STORE, payload, False)
+        self._log("saved read-cursor (%d id(s))" % len(seen_to_payload(cursor)))
 
     async def _smoke_seed(self) -> None:
         """On-device smoke: write the 4-gate sample to storage + reset the cursor.
@@ -101,66 +111,85 @@ class ApprovalVoiceWatcher(MatchingCapability):
         """
         import json
 
+        self._log("smoke_seed: start")
         payload = notifications_to_payload(SAMPLE_NOTIFICATIONS)
         text = json.dumps(payload, ensure_ascii=False, indent=2)
-        if await self.capability_worker.check_if_file_exists(SEEN_STORE, False):
+        self._log("smoke_seed: built payload (%d gate(s), %d chars)"
+                  % (len(payload), len(text)))
+        seen_exists = await self.capability_worker.check_if_file_exists(SEEN_STORE, False)
+        self._log("smoke_seed: seen exists=%s" % seen_exists)
+        if seen_exists:
             await self.capability_worker.delete_file(SEEN_STORE, False)
-        if await self.capability_worker.check_if_file_exists(QUEUE_STORE, False):
+            self._log("smoke_seed: reset read-cursor")
+        queue_exists = await self.capability_worker.check_if_file_exists(QUEUE_STORE, False)
+        self._log("smoke_seed: queue exists=%s" % queue_exists)
+        if queue_exists:
             await self.capability_worker.delete_file(QUEUE_STORE, False)
         await self.capability_worker.write_file(QUEUE_STORE, text, False)
-        self.worker.editor_logging_handler.info(
-            "[ApprovalVoice] smoke autoseed -> %d gate(s) written to %s"
-            % (len(payload), QUEUE_STORE)
-        )
+        self._log("smoke_seed: wrote %d gate(s) to %s -> end"
+                  % (len(payload), QUEUE_STORE))
 
     async def _read_aloud(self, fresh: list) -> None:
         """Verbatim readout of new gates. Interrupt ONCE, then speak each."""
         # Interrupt once before speaking (never inside the loop) — also stops the
         # daemon's output being re-transcribed as user input (one-way guard).
+        self._log("read_aloud: start (%d gate(s)); sending interrupt" % len(fresh))
         await self.capability_worker.send_interrupt_signal()
-        for item in fresh:
-            await self.capability_worker.speak(render_speech(item))
+        self._log("read_aloud: interrupt sent")
+        for i, item in enumerate(fresh, start=1):
+            text = render_speech(item)
+            self._log("read_aloud: speak %d/%d (gate=%s, %d chars)"
+                      % (i, len(fresh), item.gate, len(text)))
+            await self.capability_worker.speak(text)
+            self._log("read_aloud: speak %d/%d done" % (i, len(fresh)))
+        self._log("read_aloud: end")
 
     async def watch_queue(self) -> None:
         """Infinite poll loop: detect unread gates -> verbatim readout. Read-only."""
         import json
 
+        self._log("watch_queue: task started (SMOKE_AUTOSEED=%s, background_daemon_mode=%s)"
+                  % (SMOKE_AUTOSEED, self.background_daemon_mode))
         if SMOKE_AUTOSEED:
             try:
                 await self._smoke_seed()
             except Exception as e:  # seeding must never prevent the daemon starting
-                self.worker.editor_logging_handler.info(
-                    "[ApprovalVoice] smoke autoseed error: %s" % e
-                )
-        self.worker.editor_logging_handler.info(
-            "[ApprovalVoice] background.py ACTIVE — polling storage %s every %ss"
-            % (QUEUE_STORE, POLL_SECONDS)
-        )
+                import traceback
+                self._log("smoke autoseed error: %s\n%s" % (e, traceback.format_exc()))
+        else:
+            self._log("watch_queue: SMOKE_AUTOSEED is False -> no autoseed")
+        self._log("background.py ACTIVE — polling storage %s every %ss"
+                  % (QUEUE_STORE, POLL_SECONDS))
+        tick = 0
         while True:
+            tick += 1
             try:
-                if await self.capability_worker.check_if_file_exists(QUEUE_STORE, False):
+                exists = await self.capability_worker.check_if_file_exists(QUEUE_STORE, False)
+                if exists:
                     raw = await self.capability_worker.read_file(QUEUE_STORE, False)
                     items = items_from_raw(json.loads(raw))      # read-only
-                    cursor = ReadCursor(await self._load_seen())  # local cursor
+                    seen = await self._load_seen()                # local cursor
+                    cursor = ReadCursor(seen)
                     fresh = cursor.unread(items)
+                    if tick <= 3 or fresh:
+                        self._log("poll tick=%d: queue_exists=True raw=%dchars items=%d "
+                                  "seen=%d fresh=%d"
+                                  % (tick, len(raw), len(items), len(seen), len(fresh)))
                     if fresh:
-                        self.worker.editor_logging_handler.info(
-                            "[ApprovalVoice] %d new gate(s) -> reading aloud" % len(fresh)
-                        )
                         await self._read_aloud(fresh)
                         cursor.mark_read(fresh)
                         await self._save_seen(cursor)             # persist locally
+                elif tick <= 3:
+                    self._log("poll tick=%d: queue_exists=False (nothing to read)" % tick)
             except Exception as e:  # never let one bad tick kill the daemon
-                self.worker.editor_logging_handler.info(
-                    "[ApprovalVoice] poll error: %s" % e
-                )
+                import traceback
+                self._log("poll error (tick=%d): %s\n%s" % (tick, e, traceback.format_exc()))
             await self.worker.session_tasks.sleep(POLL_SECONDS)
 
     def call(self, worker: AgentWorker, background_daemon_mode: bool):
         self.worker = worker
         self.background_daemon_mode = background_daemon_mode
         self.capability_worker = CapabilityWorker(self.worker)
-        self.worker.editor_logging_handler.info(
-            "[ApprovalVoice] background.py call() — starting watch_queue task"
-        )
+        self._log("call() entered (background_daemon_mode=%s, SMOKE_AUTOSEED=%s) "
+                  "— creating watch_queue task" % (background_daemon_mode, SMOKE_AUTOSEED))
         self.worker.session_tasks.create(self.watch_queue())

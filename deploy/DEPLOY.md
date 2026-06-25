@@ -230,6 +230,64 @@ daemon は real exporter データのみ読む。
 - 1 回読んだ後 2 回目が鳴らない: 正常（seen で dedup 済み）。再試行は**セッション再起動**だけ
   （daemon が再起動時に seen を reset して同じ 4 件を再 seed する）。
 
+### 5.5 ログ取得と原因切り分け（実機診断・Refs #11）
+
+daemon は各ステップを `editor_logging_handler.info` で出力する（`[ApprovalVoice] ...`）。
+**第一情報源は Dashboard の "Open In Editor" → log タブ**（このハンドラの出力先）。
+
+**期待されるログ列**（正常時、上から順に出る）:
+
+```
+[ApprovalVoice] call() entered (background_daemon_mode=..., SMOKE_AUTOSEED=True) — creating watch_queue task
+[ApprovalVoice] watch_queue: task started (SMOKE_AUTOSEED=True, background_daemon_mode=...)
+[ApprovalVoice] smoke_seed: start
+[ApprovalVoice] smoke_seed: built payload (4 gate(s), 972 chars)
+[ApprovalVoice] smoke_seed: seen exists=False
+[ApprovalVoice] smoke_seed: queue exists=False
+[ApprovalVoice] smoke_seed: wrote 4 gate(s) to announce_queue.json -> end
+[ApprovalVoice] background.py ACTIVE — polling storage announce_queue.json every 15.0s
+[ApprovalVoice] poll tick=1: queue_exists=True raw=972chars items=4 seen=0 fresh=4
+[ApprovalVoice] read_aloud: start (4 gate(s)); sending interrupt
+[ApprovalVoice] read_aloud: interrupt sent
+[ApprovalVoice] read_aloud: speak 1/4 (gate=worker_complete, 88 chars)
+[ApprovalVoice] read_aloud: speak 1/4 done
+... (2/4, 3/4, 4/4) ...
+[ApprovalVoice] read_aloud: end
+[ApprovalVoice] saved read-cursor (4 id(s))
+```
+
+**どこで止まったか → 原因の早見表**:
+
+| 最後に出たログ | 推定原因 / 次の手 |
+|---|---|
+| （何も出ない） | daemon が起動していない。capability が agent に **install + enable** 済みか、background_daemon として登録されているか、セッションを開始したかを確認 |
+| `call() entered` まで | `watch_queue` タスクが回っていない（runtime の task scheduling）。`background_daemon_mode` の値をログで確認 |
+| `smoke_seed: start` 付近で `smoke autoseed error: ... <traceback>` | storage API（`write_file`/`check_if_file_exists` 等）のシグネチャ/挙動差。traceback を窓口へ |
+| `smoke_seed: ... -> end` は出るが `poll tick=1: queue_exists=False` | `write_file` が永続していない（temp フラグ/storage 名）。traceback と合わせ確認 |
+| `poll tick=1: ... fresh=0`（items=0 や seen=4） | seed と読み取りの storage 名ズレ、または既読カーソルが残存。`SMOKE_AUTOSEED` 値も確認 |
+| `poll error (tick=...): ... <traceback>` | read/parse/読み上げ中の例外。traceback を窓口へ |
+| `read_aloud: speak 4/4 done` まで**出る**のに**無音** | コード経路は健全 = **audio device 問題**。下記 §5.5.1 |
+
+`SMOKE_AUTOSEED` が False と出ていたら `approval_voice/sample.py` を True に戻す。
+
+#### 5.5.1 speak は走るのに無音（audio device）
+
+`read_aloud: speak ... done` が出ているのにスピーカーから聞こえない場合、ability の発話経路は
+正常で **DevKit の音声出力**側の問題:
+- **Bluetooth スピーカーが接続・選択されているか**（profile `a2dp-sink`、design.md §M3.6.3）。
+- USB マイク/スピーカーの default device 設定。
+- OpenHome の他 ability（trigger 起動の通常会話）で音声が出るか試し、audio 自体の導通を切り分ける。
+- storage 書込みは `smoke_seed: wrote ...` ログで確認できる（speak とは独立に storage 健全性を確認可能）。
+
+#### 5.5.2 Pi 側 runtime ログ（補助）
+
+editor log タブが取れれば通常は十分。さらに Pi 上の runtime ログを見たい場合は SSH して
+OpenHome runtime のサービスログ（`journalctl` 等）を参照する（**サービス名/ログパスは
+OpenHome DevKit OS 依存のため実機で確認**。公式 doc に明記なし）。
+
+> 注: 上記の厚いログは M3.1 実機 bring-up 用の診断 instrumentation。読み上げ確認後は
+> `background.py` の `_log` 呼び出しを間引いてよい（`[ApprovalVoice]` prefix で grep 可能）。
+
 ---
 
 ## 6. 既知の「要検証」（スモークの障害にしない）
