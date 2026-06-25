@@ -186,8 +186,45 @@ poll 間隔は `approval_voice/storage.py` の `POLL_SECONDS`（既定 15 秒）
 3. その後 poll ループで 4 ゲートを逐語読み上げ。
 
 **再試行はセッション再起動だけ**（daemon が再起動のたびに reset + 再 seed）。SSH も trigger も
-seed_queue も不要。本番（Issue #7）は `SMOKE_AUTOSEED=False` にすると self-seed が止まり、
-daemon は real exporter データのみ読む。
+seed_queue も不要。
+
+> ℹ️ **既定は本番モード（`SMOKE_AUTOSEED=False`）**: `approval_voice/sample.py` の
+> 既定値は **False**（self-seed しない＝ real exporter データのみ読む）。トリガ不要の
+> 端末内完結スモークを回したいときだけ **True に戻す**（起動時に 4 ゲートを再 seed +
+> 既読カーソル reset）。本番の live データ供給は §4.3 の live pull を使う。
+
+### 4.3 本番の live pull（PC->DevKit, §M3.3.1 candidate (a)）
+
+self-seed を止めた本番では、PC 側 exporter（PR1）が §1.3 キュー JSON を HTTP で配信し、
+DevKit 上の daemon が **poll 毎にその URL を GET → 検証 → 自 storage の
+`announce_queue.json` へ write → 既存の dedup/render/speak に流す**。設定は 1 箇所:
+
+```python
+# approval_voice/storage.py
+ANNOUNCE_SOURCE_URL = "http://<PC-host>:<port>/announce_queue.json"  # 既定 None = 無効
+```
+
+- `None`（既定）なら pull は無効（storage にあるものだけ読む）。URL を設定すると live pull が有効。
+- **http(s) のみ**許可（`approval_voice/source.py`）。`file://` 等は拒否（GET がローカル
+  ファイル読取りに化けるのを構造的に防止）。env 変数は `os` 禁止のため使えず、この定数が唯一の設定点。
+- **一方向厳守**: daemon は **GET（受信）のみ**。PC へ POST/PUT で書き戻す経路を構造的に持たない
+  （`tests/test_outbound_one_way.py` が AST で担保）。PC スリープ/サーバ停止時はその tick を
+  スキップ（最後に取得できたキューを保持）。
+- PC 側 exporter は **同一 LAN で最小 HTTP サーバ**として配信（例: キュー dir で
+  `py -3 -m http.server <port>`、または PR1 の exporter プロセス）。envelope は §1.3 配列で
+  PR1 と一致必須（id/gate/title/question/subject/options[]/created_at）。
+- **既知の挙動（意図的）**: (1) フェッチ body は `items_from_raw` で**全件検証してから**
+  storage へ書く＝ **1 件でも不正/未知 gate があるとその tick の body 全体を破棄**（直前の
+  good キューを保持。exporter は完全な §1.3 配列を出すこと＝PR1 と共有の schema.py 契約）。
+  (2) body は `MAX_FETCH_BYTES`（既定 1 MiB）で上限。(3) urllib は http(s)→http(s)
+  リダイレクトを辿る（GET のまま・非ネットワーク scheme へのリダイレクトは urllib が拒否＝
+  一方向/ローカル読取り不可は不変）。直結 URL の信頼 exporter では問題にならない。
+
+> ⚠️ **実機検証の第 1 項目（front-load）**: ability プロセスが appliance sandbox から
+> **outbound LAN 通信（HTTP GET）を行えるか**は OpenHome 公式 doc に記載がなく **≈要検証**。
+> ユーザーが実機でまずこの egress 可否を確認する。GET 不可なら §M3.3.1 の fallback 順
+> （push: scp/rsync > 共有マウント > broker）へ切替える。`urllib` を使っているのは
+> 「stdlib のみ・sandbox denylist 非該当・GET 専用」のため。
 
 ---
 
@@ -294,10 +331,12 @@ OpenHome DevKit OS 依存のため実機で確認**。公式 doc に明記なし
 
 - **本番（live org state → 端末 storage）の配送**: storage-name モデルでは ability は
   自分の `capability_worker` storage しか読めない。PC 上で発生する live `awaiting_user`
-  state をその storage へどう届けるか（ability が outbound GET → `write_file` で自 storage へ
-  落とす案など）は **Issue #7（on-device end-to-end）の確定事項**。ability の outbound 通信
-  可否は §M3.3.1 の ≈要検証。本スモークは daemon の self-seed（`SMOKE_AUTOSEED`）で端末内完結
-  するためブロッカーにしない。Issue #7 は `SMOKE_AUTOSEED=False` で self-seed を止める。
+  state をその storage へどう届けるかは、§M3.3.1 candidate (a)（ability が outbound GET →
+  `write_file` で自 storage へ落とす）として **実装済み**（§4.3 / `ANNOUNCE_SOURCE_URL`）。
+  残る ≈要検証は **ability の outbound 通信（egress）可否**のみで、これが**実機検証の第 1 項目**
+  （§4.3 の注記）。GET 不可なら §M3.3.1 の fallback 順へ切替える。self-seed スモーク
+  （`SMOKE_AUTOSEED=True`）は egress 非依存で端末内完結するため、egress 検証前でも読み上げ経路の
+  導通は確認できる。
 
 ---
 
@@ -310,5 +349,7 @@ OpenHome DevKit OS 依存のため実機で確認**。公式 doc に明記なし
 | `examples/announce_queue.json` | canonical 4 ゲートサンプル（§1.3 準拠・test 済） |
 | `openhome_ability/background.py` | on-device 常駐 daemon（自動起動・self-seed・storage API で polling・逐語 speak） |
 | `openhome_ability/main.py` | interactive 導通確認（status 読み上げのみ・必須ファイル） |
-| `approval_voice/sample.py` | スモーク seed データ + `SMOKE_AUTOSEED` フラグ（Issue #7 で False） |
-| `approval_voice/` | 純ロジック（schema/renderer/poller/bridge/storage/sample/...）= 単一の真実源 |
+| `approval_voice/sample.py` | スモーク seed データ + `SMOKE_AUTOSEED` フラグ（既定 False=本番） |
+| `approval_voice/source.py` | live pull の URL ポリシー（http(s) のみ許可・pure・一方向/sandbox ガード） |
+| `approval_voice/storage.py` | storage 名 + `POLL_SECONDS` + `ANNOUNCE_SOURCE_URL`（live pull 設定点） |
+| `approval_voice/` | 純ロジック（schema/renderer/poller/bridge/storage/source/sample/...）= 単一の真実源 |

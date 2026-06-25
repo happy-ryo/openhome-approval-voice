@@ -5,6 +5,19 @@ This is the M3 *real* replacement for the M2 mock `ApprovalVoiceAbility`
 on the DevKit, polls a persistent storage file for the announce queue, and reads
 each new `awaiting_user` gate aloud **verbatim** via `capability_worker.speak()`.
 
+LIVE PC->DevKit PULL (design.md §M3.3.1 / §M3.1-s.5): when
+`storage.ANNOUNCE_SOURCE_URL` is set, each poll first GETs that URL (the PC-side
+exporter publishing the §1.3 queue over HTTP), validates the body, and writes it
+into `QUEUE_STORE` — then the unchanged read/dedup/render/speak pass runs. This
+is the production transport that replaces the trigger-free self-seed. It is
+**strictly one-way**: the daemon only ever GETs (receives); it never POSTs/PUTs
+anything back to the PC, and the http(s)-only scheme guard (approval_voice/
+source.py) keeps the pull from degrading into a local-file read. A failed/asleep
+PC just skips that tick (the last good queue in storage is preserved). The GET is
+a blocking `urllib.request.urlopen` with a short timeout (< POLL_SECONDS): the
+event loop pauses up to the timeout when the PC is unreachable — acceptable for a
+poll daemon; `run_in_executor` is the documented follow-up if that ever matters.
+
 LIFECYCLE (design.md §M3.1-sandbox.6): a background_daemon **starts automatically
 on session and has NO trigger words** ("No triggers for this ability" on the
 Dashboard is expected, not a bug). It therefore cannot rely on the interactive
@@ -54,7 +67,15 @@ from .approval_voice.bridge import items_from_raw, notifications_to_payload
 from .approval_voice.poller import ReadCursor, seen_from_raw, seen_to_payload
 from .approval_voice.renderer import render_speech
 from .approval_voice.sample import SAMPLE_NOTIFICATIONS, SMOKE_AUTOSEED
-from .approval_voice.storage import POLL_SECONDS, QUEUE_STORE, SEEN_STORE
+from .approval_voice.source import is_http_url
+from .approval_voice.storage import (
+    ANNOUNCE_SOURCE_URL,
+    FETCH_TIMEOUT_SECONDS,
+    MAX_FETCH_BYTES,
+    POLL_SECONDS,
+    QUEUE_STORE,
+    SEEN_STORE,
+)
 
 
 class ApprovalVoiceWatcher(MatchingCapability):
@@ -127,6 +148,80 @@ class ApprovalVoiceWatcher(MatchingCapability):
         self._log("smoke_seed: wrote %d gate(s) to %s -> end"
                   % (len(payload), QUEUE_STORE))
 
+    async def _fetch_queue(self, url: str):
+        """GET the announce queue from the PC exporter; return body text or None.
+
+        One-way pull (design.md §M3.3.1): the configured URL is passed straight
+        to `urllib.request.urlopen` with NO `data=` argument, so the request is a
+        GET — there is structurally no body sent to the PC and therefore no
+        write-back channel (§3.1). The http(s)-only guard runs first so a
+        misconfigured non-network URL can never become a local-file read. The body
+        is read with a size cap so a misconfigured large response is skipped, not
+        buffered whole. Any failure (unreachable PC, timeout, non-2xx, oversize,
+        decode error) returns None so the caller skips this tick and keeps the
+        last good queue in storage. Blocking GET with a short timeout: see module
+        docstring.
+
+        Known limitation (design.md §M3.3.1): urllib follows http(s)->http(s)
+        redirects; the scheme guard validates the configured URL, not a redirect
+        target. A redirect is still a GET (no write-back) and a redirect to a
+        non-network scheme is refused by urllib, so neither breaks the one-way /
+        no-local-read invariants. A trusted same-LAN exporter pointed straight at
+        the queue file is not expected to redirect.
+        """
+        # method-local import: a module-scope import is banned by the sandbox, and
+        # urllib is not on the forbidden-module denylist (§M3.1-s.7).
+        import urllib.request
+
+        if not is_http_url(url):
+            self._log("fetch: source url rejected (http/https only): %r" % url)
+            return None
+        try:
+            with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT_SECONDS) as resp:
+                body = resp.read(MAX_FETCH_BYTES + 1)
+            if len(body) > MAX_FETCH_BYTES:
+                self._log("fetch: response exceeds %d bytes — skipping tick"
+                          % MAX_FETCH_BYTES)
+                return None
+            return body.decode("utf-8")
+        except Exception as e:
+            # A sleeping PC / stopped server must not crash the daemon; skip tick.
+            self._log("fetch error (skipping tick): %s" % repr(e))
+            return None
+
+    async def _refresh_from_source(self, url: str, tick: int) -> None:
+        """Pull the queue from the PC exporter and persist it to QUEUE_STORE.
+
+        Validates the fetched body (json.loads -> items_from_raw) BEFORE writing,
+        so a 200-with-garbage response can never clobber a good queue file: on any
+        fetch/parse failure the prior storage is left intact and the normal read
+        pass re-reads whatever was last good. On success the body is written with
+        the documented delete-then-write pattern (no half-written queue).
+
+        Validation is intentionally all-or-nothing: a single malformed / unknown-
+        gate item makes items_from_raw raise, so the whole response is discarded
+        for that tick (the exporter must emit a fully valid §1.3 array — the same
+        schema.py contract shared with PR1). This favors the no-clobber guarantee
+        over partial readout; the last good queue keeps being read until the
+        exporter returns a clean body.
+        """
+        import json
+
+        text = await self._fetch_queue(url)
+        if text is None:
+            return
+        try:
+            items = items_from_raw(json.loads(text))   # validate only (read-only)
+        except Exception as e:
+            self._log("fetch: discarding unparseable body (%s)" % repr(e))
+            return
+        if await self.capability_worker.check_if_file_exists(QUEUE_STORE, False):
+            await self.capability_worker.delete_file(QUEUE_STORE, False)
+        await self.capability_worker.write_file(QUEUE_STORE, text, False)
+        if tick <= 3:
+            self._log("fetch: refreshed queue from source (%d item(s), %d chars)"
+                      % (len(items), len(text)))
+
     async def _read_aloud(self, fresh: list) -> None:
         """Verbatim readout of new gates. Interrupt ONCE, then speak each."""
         # Interrupt once before speaking (never inside the loop) — also stops the
@@ -142,12 +237,40 @@ class ApprovalVoiceWatcher(MatchingCapability):
             self._log("read_aloud: speak %d/%d done" % (i, len(fresh)))
         self._log("read_aloud: end")
 
-    async def watch_queue(self) -> None:
-        """Infinite poll loop: detect unread gates -> verbatim readout. Read-only."""
+    async def _drain_queue_once(self, tick: int) -> None:
+        """One read pass: load QUEUE_STORE, speak any unread gates, persist cursor.
+
+        Read-only with respect to the org: it reads the queue from local storage,
+        speaks fresh gates and advances the *local* read cursor only (§3.2). Split
+        out of the poll loop so the live-pull refresh and the read pass are each
+        independently testable.
+        """
         import json
 
-        self._log("watch_queue: task started (SMOKE_AUTOSEED=%s, background_daemon_mode=%s)"
-                  % (SMOKE_AUTOSEED, self.background_daemon_mode))
+        exists = await self.capability_worker.check_if_file_exists(QUEUE_STORE, False)
+        if not exists:
+            if tick <= 3:
+                self._log("poll tick=%d: queue_exists=False (nothing to read)" % tick)
+            return
+        raw = await self.capability_worker.read_file(QUEUE_STORE, False)
+        items = items_from_raw(json.loads(raw))          # read-only
+        seen = await self._load_seen()                    # local cursor
+        cursor = ReadCursor(seen)
+        fresh = cursor.unread(items)
+        if tick <= 3 or fresh:
+            self._log("poll tick=%d: queue_exists=True raw=%dchars items=%d "
+                      "seen=%d fresh=%d"
+                      % (tick, len(raw), len(items), len(seen), len(fresh)))
+        if fresh:
+            await self._read_aloud(fresh)
+            cursor.mark_read(fresh)
+            await self._save_seen(cursor)                 # persist locally
+
+    async def watch_queue(self) -> None:
+        """Infinite poll loop: (live pull ->) detect unread gates -> readout."""
+        self._log("watch_queue: task started (SMOKE_AUTOSEED=%s, source=%s, "
+                  "background_daemon_mode=%s)"
+                  % (SMOKE_AUTOSEED, bool(ANNOUNCE_SOURCE_URL), self.background_daemon_mode))
         if SMOKE_AUTOSEED:
             try:
                 await self._smoke_seed()
@@ -155,29 +278,15 @@ class ApprovalVoiceWatcher(MatchingCapability):
                 self._log("smoke autoseed error: %s" % repr(e))
         else:
             self._log("watch_queue: SMOKE_AUTOSEED is False -> no autoseed")
-        self._log("background.py ACTIVE — polling storage %s every %ss"
-                  % (QUEUE_STORE, POLL_SECONDS))
+        self._log("background.py ACTIVE — polling storage %s every %ss (source pull=%s)"
+                  % (QUEUE_STORE, POLL_SECONDS, bool(ANNOUNCE_SOURCE_URL)))
         tick = 0
         while True:
             tick += 1
             try:
-                exists = await self.capability_worker.check_if_file_exists(QUEUE_STORE, False)
-                if exists:
-                    raw = await self.capability_worker.read_file(QUEUE_STORE, False)
-                    items = items_from_raw(json.loads(raw))      # read-only
-                    seen = await self._load_seen()                # local cursor
-                    cursor = ReadCursor(seen)
-                    fresh = cursor.unread(items)
-                    if tick <= 3 or fresh:
-                        self._log("poll tick=%d: queue_exists=True raw=%dchars items=%d "
-                                  "seen=%d fresh=%d"
-                                  % (tick, len(raw), len(items), len(seen), len(fresh)))
-                    if fresh:
-                        await self._read_aloud(fresh)
-                        cursor.mark_read(fresh)
-                        await self._save_seen(cursor)             # persist locally
-                elif tick <= 3:
-                    self._log("poll tick=%d: queue_exists=False (nothing to read)" % tick)
+                if ANNOUNCE_SOURCE_URL:
+                    await self._refresh_from_source(ANNOUNCE_SOURCE_URL, tick)
+                await self._drain_queue_once(tick)
             except Exception as e:  # never let one bad tick kill the daemon
                 self._log("poll error (tick=%d): %s" % (tick, repr(e)))
             await self.worker.session_tasks.sleep(POLL_SECONDS)

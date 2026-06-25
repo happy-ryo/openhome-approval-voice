@@ -22,8 +22,12 @@ app-specific role storage.py / speak.py play — not shared sister-project logic
 It is pure data (no file I/O, no encoding), so it stays sandbox-clean.
 """
 
-# Smoke autoseed switch. True for the M3.1 on-device smoke; Issue #7 sets False.
-SMOKE_AUTOSEED = True
+# Smoke autoseed switch. Issue #7 (production) sets this False: the daemon no
+# longer injects this sample and reads only what the real exporter delivers — via
+# the live PC->DevKit pull (storage.ANNOUNCE_SOURCE_URL) or whatever else has
+# written QUEUE_STORE. Flip back to True only to re-run the trigger-free on-device
+# smoke (it re-seeds the 4-gate sample and resets the read cursor on startup).
+SMOKE_AUTOSEED = False
 
 # Canonical 4-gate sample (worker_complete / ci_merge / escalation / reply_relay),
 # 1 each, mirroring examples/announce_queue.json. Run through the bridge's
