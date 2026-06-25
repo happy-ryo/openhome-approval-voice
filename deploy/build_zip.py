@@ -17,7 +17,7 @@ zip レイアウト（既定 = ラップフォルダ `approvalvoice/`、相対 i
 
     approval-voice-ability.zip
     └── approvalvoice/         ← ラップフォルダ（= パッケージ）
-        ├── main.py            ← interactive entry（seed + status 読み上げ）
+        ├── main.py            ← interactive entry（status 読み上げのみ・必須ファイル）
         ├── background.py      ← background daemon（storage polling→逐語 speak）
         ├── __init__.py        ← パッケージマーカ（相対 import に必須）
         ├── requirements.txt   ← stdlib only
@@ -44,7 +44,8 @@ zip レイアウト（既定 = ラップフォルダ `approvalvoice/`、相対 i
    無いことを実証する。
 4. 続けて `examples/announce_queue.json`（4 ゲートサンプル）を実データ経路
    items_from_raw→ReadCursor→render_speech に流し、4 件レンダリングできること、
-   および main.py の seed payload が bridge を通って 4 件になることを確認する。
+   および daemon の self-seed サンプル（approval_voice/sample.py）が bridge を通って
+   4 件になることを確認する。
 
 使い方::
 
@@ -222,9 +223,12 @@ def verify_zip(zip_path: str, arc_prefix: str) -> None:
             spoken = [renderer.render_speech(i) for i in fresh]
             assert len(spoken) == 4, len(spoken)
 
-            # 3) main.py の seed payload も bridge を通って 4 件になる（公開衛生 + gate 検証）
-            seeded = bridge.notifications_to_payload(mn.SEED_NOTIFICATIONS)
+            # 3) daemon の smoke autoseed サンプルも bridge を通って 4 件になる
+            #    （公開衛生 + gate 検証）。daemon import 済 = sample/flag の相対 import も健全。
+            sample = importlib.import_module(pkg + ".approval_voice.sample")
+            seeded = bridge.notifications_to_payload(sample.SAMPLE_NOTIFICATIONS)
             assert len(seeded) == 4, len(seeded)
+            assert isinstance(sample.SMOKE_AUTOSEED, bool)
 
             print("VERIFY_OK", len(spoken))
             """

@@ -69,9 +69,9 @@ def items_to_payload(items: list[AnnounceItem]) -> list[dict]:
 def notifications_to_payload(notifications: list[dict]) -> list[dict]:
     """Map raw notifications -> an encode-ready queue payload (public-hygiene applied).
 
-    Convenience for the seed path (`main.py` writes the canonical 4-gate sample
-    into storage so the on-device smoke needs no SSH): each notification is run
-    through `notification_to_item` so the §1.3 whitelist + gate validation apply
-    to seeded data too, then reduced to plain dicts.
+    Convenience for the seed path (`background.py` self-seeds the canonical
+    4-gate sample into storage on startup so the on-device smoke needs no trigger
+    or SSH): each notification is run through `notification_to_item` so the §1.3
+    whitelist + gate validation apply to seeded data too, then reduced to plain dicts.
     """
     return items_to_payload([notification_to_item(n) for n in notifications])

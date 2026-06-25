@@ -109,6 +109,20 @@ def test_seen_cursor_payload_roundtrips_across_restart():
     assert restored == {"a"}
 
 
+def test_smoke_sample_seeds_all_four_gates():
+    # The daemon self-seeds approval_voice.sample.SAMPLE_NOTIFICATIONS on startup
+    # (background_daemon has no trigger). It must cover all 4 gates and each must
+    # render to a one-way readout, so the on-device smoke speaks the full set.
+    from approval_voice.renderer import ONE_WAY_SUFFIX, render_speech
+    from approval_voice.sample import SAMPLE_NOTIFICATIONS
+
+    items = items_from_raw(notifications_to_payload(SAMPLE_NOTIFICATIONS))
+    assert len(items) == 4
+    assert {i.gate for i in items} == set(GATES)
+    for i in items:
+        assert render_speech(i).endswith(ONE_WAY_SUFFIX)
+
+
 def test_seen_from_raw_is_defensive():
     # A corrupt cursor payload must yield "nothing seen", never crash the daemon
     # (the json-decode failure itself is caught in background.py).

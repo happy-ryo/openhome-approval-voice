@@ -5,6 +5,14 @@ This is the M3 *real* replacement for the M2 mock `ApprovalVoiceAbility`
 on the DevKit, polls a persistent storage file for the announce queue, and reads
 each new `awaiting_user` gate aloud **verbatim** via `capability_worker.speak()`.
 
+LIFECYCLE (design.md §M3.1-sandbox.6): a background_daemon **starts automatically
+on session and has NO trigger words** ("No triggers for this ability" on the
+Dashboard is expected, not a bug). It therefore cannot rely on the interactive
+`main.py` being voice-triggered to seed the queue. So for the on-device smoke this
+daemon **self-seeds** the canonical 4-gate sample on startup when
+`SMOKE_AUTOSEED` is true, then reads it aloud — no trigger, no SSH. Issue #7 sets
+`SMOKE_AUTOSEED = False` so the daemon reads only real exporter data.
+
 Grounded against a real shipped background ability
 (openhome-dev/abilities · community/alarm-timer/background.py): same framework
 imports, `# {{register capability}}` marker, `call(self, worker,
@@ -44,9 +52,10 @@ from src.agent.capability_worker import CapabilityWorker
 from src.main import AgentWorker
 
 # Resolve the bundled pure logic (single source of truth) by relative import.
-from .approval_voice.bridge import items_from_raw
+from .approval_voice.bridge import items_from_raw, notifications_to_payload
 from .approval_voice.poller import ReadCursor, seen_from_raw, seen_to_payload
 from .approval_voice.renderer import render_speech
+from .approval_voice.sample import SAMPLE_NOTIFICATIONS, SMOKE_AUTOSEED
 from .approval_voice.storage import POLL_SECONDS, QUEUE_STORE, SEEN_STORE
 
 
@@ -82,6 +91,28 @@ class ApprovalVoiceWatcher(MatchingCapability):
             await self.capability_worker.delete_file(SEEN_STORE, False)
         await self.capability_worker.write_file(SEEN_STORE, payload, False)
 
+    async def _smoke_seed(self) -> None:
+        """On-device smoke: write the 4-gate sample to storage + reset the cursor.
+
+        A background_daemon has no trigger, so the daemon seeds itself instead of
+        waiting on the interactive entry. Resetting the cursor means every session
+        (re)start yields a fresh full readout (re-test = restart). Issue #7 turns
+        `SMOKE_AUTOSEED` off so this no-ops and the daemon reads real data only.
+        """
+        import json
+
+        payload = notifications_to_payload(SAMPLE_NOTIFICATIONS)
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        if await self.capability_worker.check_if_file_exists(SEEN_STORE, False):
+            await self.capability_worker.delete_file(SEEN_STORE, False)
+        if await self.capability_worker.check_if_file_exists(QUEUE_STORE, False):
+            await self.capability_worker.delete_file(QUEUE_STORE, False)
+        await self.capability_worker.write_file(QUEUE_STORE, text, False)
+        self.worker.editor_logging_handler.info(
+            "[ApprovalVoice] smoke autoseed -> %d gate(s) written to %s"
+            % (len(payload), QUEUE_STORE)
+        )
+
     async def _read_aloud(self, fresh: list) -> None:
         """Verbatim readout of new gates. Interrupt ONCE, then speak each."""
         # Interrupt once before speaking (never inside the loop) — also stops the
@@ -94,6 +125,13 @@ class ApprovalVoiceWatcher(MatchingCapability):
         """Infinite poll loop: detect unread gates -> verbatim readout. Read-only."""
         import json
 
+        if SMOKE_AUTOSEED:
+            try:
+                await self._smoke_seed()
+            except Exception as e:  # seeding must never prevent the daemon starting
+                self.worker.editor_logging_handler.info(
+                    "[ApprovalVoice] smoke autoseed error: %s" % e
+                )
         self.worker.editor_logging_handler.info(
             "[ApprovalVoice] background.py ACTIVE — polling storage %s every %ss"
             % (QUEUE_STORE, POLL_SECONDS)
