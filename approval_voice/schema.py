@@ -11,8 +11,6 @@ org state schema, internal identifiers, machine paths, or hook names belong
 in an AnnounceItem.
 """
 
-from __future__ import annotations
-
 from dataclasses import asdict, dataclass, field
 
 # The four awaiting_user gates the Secretary stops on (design.md §2).
@@ -27,6 +25,14 @@ GATES = (
     GATE_ESCALATION,
     GATE_REPLY_RELAY,
 )
+
+
+# Explicit field-name list used by from_dict(). We do NOT introspect the dataclass
+# field map via dunder attribute access: the OpenHome add-capability sandbox rejects
+# dunder attribute access (e.g. `cls.<field-map>`) as a suspicious introspection
+# escape (design.md §M3.1-sandbox). tests/test_schema.py asserts this stays in sync
+# with the dataclass fields, so a new field can't silently desync from_dict.
+ITEM_FIELDS = ("id", "gate", "title", "question", "subject", "options", "created_at")
 
 
 @dataclass
@@ -49,7 +55,7 @@ class AnnounceItem:
 
     @classmethod
     def from_dict(cls, data: dict) -> "AnnounceItem":
-        known = {f: data[f] for f in cls.__dataclass_fields__ if f in data}
+        known = {f: data[f] for f in ITEM_FIELDS if f in data}
         return cls(**known)
 
     def to_dict(self) -> dict:

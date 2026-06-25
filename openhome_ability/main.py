@@ -1,17 +1,21 @@
-"""approval-voice — interactive entry (M3, real OpenHome).
+"""approval-voice — interactive entry (M3.1, sandbox compliant).
 
-The real readout work happens in the always-on daemon (background.py). This
-`main.py` exists only to satisfy the OpenHome ability convention (interactive
-trigger + background watcher, as in community/alarm-timer) and to give a human a
-voice way to confirm the ability is installed.
+The real readout work happens in the always-on daemon (background.py), which
+**self-seeds** the smoke sample and reads it aloud automatically (a
+background_daemon has no trigger words). This `main.py` exists to satisfy the
+OpenHome "Interactive + Daemon" convention (the canonical pattern, as in
+community/alarm-timer) and as a required bundle file. If the runtime exposes its
+trigger words, invoking it just speaks one status line confirming the reader is
+installed — the on-device smoke does NOT depend on this being triggered
+(design.md §M3.1-sandbox.6).
 
-ONE-WAY GUARANTEE (design.md §3.1): output-only. On trigger it speaks one status
-line and immediately returns control. It NEVER captures input — no
-`user_response()`, `run_io_loop()`, `run_confirmation_loop()`, or
-`start_audio_recording()`. `tests/test_one_way.py` AST-scans this file too.
+ONE-WAY GUARANTEE (design.md §3.1): output-only. It NEVER captures user input —
+`tests/test_one_way.py` AST-scans this file.
+
+M3.1 sandbox compliance: the pure-logic `approval_voice` package is resolved by
+relative import; no low-level platform access, no module-scope data-encoding
+import, no raw file access (design.md §M3.1-sandbox).
 """
-
-from __future__ import annotations
 
 from src.agent.capability import MatchingCapability
 from src.agent.capability_worker import CapabilityWorker
