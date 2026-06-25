@@ -1,0 +1,9 @@
+# PC-side exporter dependencies (NOT bundled into the DevKit ability; the
+# add-capability sandbox forbids third-party deps in the bundle, so these install
+# only on the PC running `python -m pc_exporter`).
+#
+# paramiko: SSH/SFTP client for the `push` transport (python -m pc_exporter push).
+# Only needed for a remote ssh target; `export`, `serve`, and a local --target
+# (mounted share / loopback test) work without it. A stdlib-only push would shell
+# out to scp.exe, which is not reliably present on Windows.
+paramiko>=3.0

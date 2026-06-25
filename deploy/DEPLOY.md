@@ -191,40 +191,69 @@ seed_queue も不要。
 > ℹ️ **既定は本番モード（`SMOKE_AUTOSEED=False`）**: `approval_voice/sample.py` の
 > 既定値は **False**（self-seed しない＝ real exporter データのみ読む）。トリガ不要の
 > 端末内完結スモークを回したいときだけ **True に戻す**（起動時に 4 ゲートを再 seed +
-> 既読カーソル reset）。本番の live データ供給は §4.3 の live pull を使う。
+> 既読カーソル reset）。本番の live データ供給は §4.3 を使う。
 
-### 4.3 本番の live pull（PC->DevKit, §M3.3.1 candidate (a)）
+### 4.3 本番の live データ供給（PC->DevKit, §M3.3.1）
 
-self-seed を止めた本番では、PC 側 exporter（PR1）が §1.3 キュー JSON を HTTP で配信し、
-DevKit 上の daemon が **poll 毎にその URL を GET → 検証 → 自 storage の
-`announce_queue.json` へ write → 既存の dedup/render/speak に流す**。設定は 1 箇所:
+self-seed を止めた本番では、PC 側 exporter が組織の `awaiting_user` 状態を read-only で読み、
+§1.3 キュー JSON を生成して DevKit の daemon の storage（`announce_queue.json`）へ届ける。
+daemon 側は **自 storage を読むだけ**（dedup/render/speak は不変）。届け方は 2 経路:
 
-```python
-# approval_voice/storage.py
-ANNOUNCE_SOURCE_URL = "http://<PC-host>:<port>/announce_queue.json"  # 既定 None = 無効
+#### (A) primary: requests HTTP pull（別トラックで実装）
+
+> **経験則で確定（add-capability 実測）**: ability バンドルに `import requests` を入れた
+> capability は **受理された（HTTP 201）**。公式 doc / 30+ の shipped ability も `requests` を
+> sanctioned outbound として使用する。一方 `urllib` / `http.client` / `socket` は
+> **forbidden import で reject**（urllib は HTTP 400）。よって本番 primary は
+> **`requests` ベースの HTTP GET pull**（PC 側 exporter が `py -3 -m pc_exporter serve` で
+> §1.3 を LAN 配信、DevKit が GET）で、これは**別トラック / 別 PR**で実装する。
+>
+> ⚠️ ただし **socket 層は共有**のため、`requests` が受理されても **device 上で実際に egress
+> できるか**は別問題で、**実機 GET で初めて確定**する（≈要検証）。これが実機検証の第 1 項目。
+
+#### (B) fallback: PC-side push（scp/sftp, 本 PR）
+
+primary の egress が device で**失敗した場合の正式 fallback**（design.md §M3.3.1 の推奨順位
+「HTTP pull > **push(scp)** > 共有マウント > broker」どおり）。**ability 側は一切ネットワーク
+しない**（urllib を撤去済み・bundle に network import ゼロ）。代わりに **PC が DevKit へキュー
+ファイルを push** し、daemon は従来どおり自 storage を読む。
+
+```bash
+# PC 側で常駐: state.db を read-only で読み → §1.3 を atomic 書込 → DevKit へ scp/sftp
+py -3 -m pc_exporter push \
+    --db-path <claude-org>/.state/state.db \
+    --target user@devkit:/<ability-storage-path>/announce_queue.json \
+    --interval 2
+# 単発配送: 末尾に --once。鍵指定: --identity <key>。SSH ポート: --port <n>。
 ```
 
-- `None`（既定）なら pull は無効（storage にあるものだけ読む）。URL を設定すると live pull が有効。
-- **http(s) のみ**許可（`approval_voice/source.py`）。`file://` 等は拒否（GET がローカル
-  ファイル読取りに化けるのを構造的に防止）。env 変数は `os` 禁止のため使えず、この定数が唯一の設定点。
-- **一方向厳守**: daemon は **GET（受信）のみ**。PC へ POST/PUT で書き戻す経路を構造的に持たない
-  （`tests/test_outbound_one_way.py` が AST で担保）。PC スリープ/サーバ停止時はその tick を
-  スキップ（最後に取得できたキューを保持）。
-- PC 側 exporter は **同一 LAN で最小 HTTP サーバ**として配信（例: キュー dir で
-  `py -3 -m http.server <port>`、または PR1 の exporter プロセス）。envelope は §1.3 配列で
-  PR1 と一致必須（id/gate/title/question/subject/options[]/created_at）。
-- **既知の挙動（意図的）**: (1) フェッチ body は `items_from_raw` で**全件検証してから**
-  storage へ書く＝ **1 件でも不正/未知 gate があるとその tick の body 全体を破棄**（直前の
-  good キューを保持。exporter は完全な §1.3 配列を出すこと＝PR1 と共有の schema.py 契約）。
-  (2) body は `MAX_FETCH_BYTES`（既定 1 MiB）で上限。(3) urllib は http(s)→http(s)
-  リダイレクトを辿る（GET のまま・非ネットワーク scheme へのリダイレクトは urllib が拒否＝
-  一方向/ローカル読取り不可は不変）。直結 URL の信頼 exporter では問題にならない。
+- **paramiko ベース**（`pc_exporter/push.py`）。stdlib だけだと `scp.exe` 呼び出しになり Windows
+  で不安定なため。`pip install -r pc_exporter/requirements.txt`（PC 側のみ・bundle 非同梱）。
+- **冪等**: `core.export_queue` は毎ループ atomic 書込で **mtime が必ず変わる**ため、素朴な mtime
+  比較では skip できない。よって **内容の SHA-256 ダイジェスト**を冪等キーにし、**前回配送と
+  同一バイト列なら再 push しない**。ただし**リモートのファイルが消えた / サイズ不一致**（DevKit
+  再起動でストレージが飛んだ等）の場合は、内容が同じでも**再 push** する（device を空のまま
+  取り残さない）。
+- **再送 / backoff**: 転送失敗時は指数バックオフ（1s,2s,4s… 上限 30s）で `--attempts`（既定 5）
+  回まで再試行。ループ mode では失敗した round は次 interval でリトライ（クラッシュしない）。
+- **リモート atomic**: `<path>.tmp` へ put → `posix_rename` で原子的に swap（daemon が半端な
+  ファイルを読まない）。ローカル target（共有マウント/テスト）は temp+`os.replace`。
+- **一方向厳守**: push は **PC -> DevKit のみ**。device から org 状態を読み戻す経路は無い。
+  ability 側は send 経路ゼロ（outbound GET も撤去済み・`tests/test_outbound_one_way.py` が AST 担保）。
+  push が device 状態を読むのは再 push 判定の `stat()` のみ。
+- **`--target` がローカルパス**（`host:` 接頭辞なし）なら **local copy transport** で配送。PC に
+  mount した DevKit 共有（§M3.3.1「共有マウント」）への drop や、loopback テストに使う。
 
-> ⚠️ **実機検証の第 1 項目（front-load）**: ability プロセスが appliance sandbox から
-> **outbound LAN 通信（HTTP GET）を行えるか**は OpenHome 公式 doc に記載がなく **≈要検証**。
-> ユーザーが実機でまずこの egress 可否を確認する。GET 不可なら §M3.3.1 の fallback 順
-> （push: scp/rsync > 共有マウント > broker）へ切替える。`urllib` を使っているのは
-> 「stdlib のみ・sandbox denylist 非該当・GET 専用」のため。
+> 🔴 **未解決の open question（実機調査必要）**: push の `--target` パスが **ability の
+> `capability_worker` storage 実体に一致するか**は **未確認**。OpenHome SDK Reference は storage を
+> **役割**でしか規定せず（`in_ability_directory=False` = "user data storage, shared across that
+> user's abilities"）、**具体的な on-disk パスを公開していない**。かつ ability は任意パスを
+> 低レベル `open()` で読めない（sandbox 禁止）ため、別の場所に push して ability が読む、という
+> 迂回もできない。**実機で `capability_worker.write_file(name, ..., False)` の実 storage パスを
+> 特定し、その場所を `--target` に指定する**のが本 fallback の最初の実機ステップ。特定不能なら
+> 共有マウント（DevKit 側で PC 共有を mount し、storage 実体をそのマウント配下に置けるか）や
+> requests pull（primary）へ寄せる。本 PR の push.py は **transport のみ**を提供し、`--target` が
+> 指す場所へファイルを確実に届けるところまでを保証する。
 
 ---
 
@@ -331,12 +360,14 @@ OpenHome DevKit OS 依存のため実機で確認**。公式 doc に明記なし
 
 - **本番（live org state → 端末 storage）の配送**: storage-name モデルでは ability は
   自分の `capability_worker` storage しか読めない。PC 上で発生する live `awaiting_user`
-  state をその storage へどう届けるかは、§M3.3.1 candidate (a)（ability が outbound GET →
-  `write_file` で自 storage へ落とす）として **実装済み**（§4.3 / `ANNOUNCE_SOURCE_URL`）。
-  残る ≈要検証は **ability の outbound 通信（egress）可否**のみで、これが**実機検証の第 1 項目**
-  （§4.3 の注記）。GET 不可なら §M3.3.1 の fallback 順へ切替える。self-seed スモーク
-  （`SMOKE_AUTOSEED=True`）は egress 非依存で端末内完結するため、egress 検証前でも読み上げ経路の
-  導通は確認できる。
+  state をその storage へどう届けるかは 2 経路（§4.3）: **(A) primary = requests HTTP pull**
+  （ability が `requests` で GET → `write_file`。`requests` は add-capability で受理＝実測 201）、
+  **(B) fallback = PC-side push**（PC が scp/sftp で storage へ配送、ability は読むだけ＝本 PR）。
+  残る ≈要検証は順に: ① **device 上で実際に egress できるか**（socket 層共有のため実機 GET で確定。
+  失敗なら (B) push へ）、② **push の `--target` が ability storage 実体に一致するか**（SDK は
+  storage を役割でしか規定せず on-disk パス非公開＝**実機調査必要**、§4.3 (B) の open question）。
+  self-seed スモーク（`SMOKE_AUTOSEED=True`）は egress / 配送非依存で端末内完結するため、配送検証前
+  でも読み上げ経路の導通は確認できる。
 
 ---
 
@@ -350,6 +381,8 @@ OpenHome DevKit OS 依存のため実機で確認**。公式 doc に明記なし
 | `openhome_ability/background.py` | on-device 常駐 daemon（自動起動・self-seed・storage API で polling・逐語 speak） |
 | `openhome_ability/main.py` | interactive 導通確認（status 読み上げのみ・必須ファイル） |
 | `approval_voice/sample.py` | スモーク seed データ + `SMOKE_AUTOSEED` フラグ（既定 False=本番） |
-| `approval_voice/source.py` | live pull の URL ポリシー（http(s) のみ許可・pure・一方向/sandbox ガード） |
-| `approval_voice/storage.py` | storage 名 + `POLL_SECONDS` + `ANNOUNCE_SOURCE_URL`（live pull 設定点） |
-| `approval_voice/` | 純ロジック（schema/renderer/poller/bridge/storage/source/sample/...）= 単一の真実源 |
+| `approval_voice/storage.py` | storage 名 + `POLL_SECONDS`（ネットワーク設定なし＝storage-only reader） |
+| `approval_voice/` | 純ロジック（schema/renderer/poller/bridge/storage/sample/...）= 単一の真実源 |
+| `pc_exporter/push.py` | **PC-side push fallback**（paramiko scp/sftp・content-hash 冪等・backoff・atomic）= 本 PR |
+| `pc_exporter/__main__.py` | exporter CLI（`export` / `serve` / **`push`**） |
+| `pc_exporter/requirements.txt` | PC 側 push の依存（`paramiko`・bundle 非同梱） |

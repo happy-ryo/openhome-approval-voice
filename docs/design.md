@@ -378,6 +378,22 @@ bridge は機能上**2 つに割れる**:
 > HTTP pull は DevKit に outbound 通信だけを求め、サーバ責務を完全制御下の PC へ寄せられるため
 > 最も単純かつ確実。ただし上記 ≈（ability の egress 可否）が実機検証の最初の確認項目。
 
+> **訂正・更新（add-capability 実測, Refs #7）**: 上の「HTTP pull は urllib で GET」という当初想定は
+> **一部誤り**だった。add-capability の静的 sandbox は **`urllib` / `http.client` / `socket` を
+> forbidden import で reject**（`urllib` 追加バンドルは HTTP 400）。一方 **`requests` は受理**
+> （inert probe バンドルが HTTP 201、capability_id=6389。公式 doc / 30+ shipped ability も `requests` を
+> sanctioned outbound として使用）。よって:
+> - **HTTP pull の primary 実装は `requests` ベース**（`urllib` ではない）。これが production primary。
+> - **push(scp/sftp) は当初の「sshd 要・受信面増」という短所評価のまま**だが、`requests` egress が
+>   **device で実際に通るか**は socket 層共有のため **実機 GET で初めて確定**（≈要検証）。通らない場合の
+>   **正式 fallback として push を実装済み**（`pc_exporter/push.py`、paramiko SFTP・content-hash 冪等・
+>   backoff・remote atomic swap）。ability 側は **outbound を完全撤去**し storage-only reader に戻したので、
+>   push 経路では bundle に network import が一切無い（sandbox denylist を構造的に回避）。
+> - **push の残 open question（実機調査必要）**: push 先パスが ability の `capability_worker` storage 実体に
+>   一致するか。SDK Reference は storage を役割（"user data storage, shared across abilities"）でしか規定せず
+>   **on-disk パス非公開**、かつ ability は任意パスを低レベルで読めない（sandbox 禁止）。実機で storage 実体
+>   パスを特定して `--target` に与えるのが push fallback の最初の実機ステップ（`deploy/DEPLOY.md` §4.3 B）。
+
 ### M3.4 デプロイ／エージェント作成（実測）
 
 - ability アップロードは REST: `POST app.openhome.com/api/capabilities/add-capability/`

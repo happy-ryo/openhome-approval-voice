@@ -23,10 +23,10 @@ It is pure data (no file I/O, no encoding), so it stays sandbox-clean.
 """
 
 # Smoke autoseed switch. Issue #7 (production) sets this False: the daemon no
-# longer injects this sample and reads only what the real exporter delivers — via
-# the live PC->DevKit pull (storage.ANNOUNCE_SOURCE_URL) or whatever else has
-# written QUEUE_STORE. Flip back to True only to re-run the trigger-free on-device
-# smoke (it re-seeds the 4-gate sample and resets the read cursor on startup).
+# longer injects this sample and reads only what the real exporter delivers — the
+# PC-side push (pc_exporter/push.py) writes the §1.3 queue into QUEUE_STORE. Flip
+# back to True only to re-run the trigger-free on-device smoke (it re-seeds the
+# 4-gate sample and resets the read cursor on startup).
 SMOKE_AUTOSEED = False
 
 # Canonical 4-gate sample (worker_complete / ci_merge / escalation / reply_relay),
