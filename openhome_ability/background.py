@@ -85,9 +85,9 @@ class ApprovalVoiceWatcher(MatchingCapability):
             return seen_from_raw(json.loads(raw))
         except Exception as e:
             # A corrupt cursor must not crash the daemon; treat as nothing-seen.
-            import traceback
-            self._log("load_seen error (treating as empty): %s\n%s"
-                      % (e, traceback.format_exc()))
+            # repr(e) gives "ExceptionType('msg')" — type + message without a
+            # forbidden `traceback` import or a `.__name__` dunder access.
+            self._log("load_seen error (treating as empty): %s" % repr(e))
             return set()
 
     async def _save_seen(self, cursor: ReadCursor) -> None:
@@ -154,8 +154,7 @@ class ApprovalVoiceWatcher(MatchingCapability):
             try:
                 await self._smoke_seed()
             except Exception as e:  # seeding must never prevent the daemon starting
-                import traceback
-                self._log("smoke autoseed error: %s\n%s" % (e, traceback.format_exc()))
+                self._log("smoke autoseed error: %s" % repr(e))
         else:
             self._log("watch_queue: SMOKE_AUTOSEED is False -> no autoseed")
         self._log("background.py ACTIVE — polling storage %s every %ss"
@@ -182,8 +181,7 @@ class ApprovalVoiceWatcher(MatchingCapability):
                 elif tick <= 3:
                     self._log("poll tick=%d: queue_exists=False (nothing to read)" % tick)
             except Exception as e:  # never let one bad tick kill the daemon
-                import traceback
-                self._log("poll error (tick=%d): %s\n%s" % (tick, e, traceback.format_exc()))
+                self._log("poll error (tick=%d): %s" % (tick, repr(e)))
             await self.worker.session_tasks.sleep(POLL_SECONDS)
 
     def call(self, worker: AgentWorker, background_daemon_mode: bool):

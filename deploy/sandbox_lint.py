@@ -19,6 +19,11 @@ Rule sources (grounded, design.md §M3.1):
   attribute access" — any `expr.__name__` attribute access (introspection escape).
   Reproduced AST-side below (`_dunder_violations`); dunder method defs / imports /
   `__all__` are NOT attribute access and stay allowed.
+- add-capability server response (observed): "Forbidden module import: <name>" —
+  importing a debug/introspection/unsafe module (seen for `traceback`, reported as
+  `trace`). Reproduced by the `_FORBIDDEN_IMPORT_MODULES` denylist below, matched at
+  ANY scope. This denylist is the single place to extend when a new such rejection
+  is observed.
 
 We enforce the UNION so the bundle passes either scanner. The scan is run over
 raw source (comments + docstrings included) on purpose: the SDK reference notes
@@ -47,8 +52,6 @@ _RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"(?m)^\s*import\s+signal\b"), "import signal (low-level signal module)"),
     (re.compile(r"(?m)^\s*from\s+signal\b"), "from signal import (low-level signal module)"),
     (re.compile(r"\bsignal\.[A-Za-z_]"), "signal.* usage (low-level signal module)"),
-    (re.compile(r"\bimport\s+redis\b"), "import redis (platform internal)"),
-    (re.compile(r"\bimport\s+user_config\b"), "import user_config (platform internal)"),
     (re.compile(r"\bconnection_manager\b"), "connection_manager (platform internal)"),
     (re.compile(r"\bopen\s*\("), "raw open( - use capability_worker file helpers"),
     (re.compile(r"\bprint\s*\("), "print( - use editor_logging_handler"),
@@ -73,6 +76,26 @@ _RULES: list[tuple[re.Pattern, str]] = [
 # No allowlist is needed: the bundle has zero legitimate dunder attribute access.
 _DUNDER_RE = re.compile(r"^__\w+__$")
 _GETATTR_FAMILY = {"getattr", "setattr", "hasattr", "delattr"}
+
+# Forbidden-module denylist (server-side add-capability). The server rejects
+# `import <name>` of debug / introspection / unsafe-serialization / platform
+# modules with "Forbidden module import: <name>" — observed for `traceback`
+# (reported as `trace`) when added for diagnostics. The exact list is not public,
+# so this is built from observed rejections + the obvious siblings; **extend this
+# set the moment a new "Forbidden module import" rejection is seen** (that is the
+# single maintenance point the rest of the pipeline keys off). Matched on the
+# top-level package of any import, ANYWHERE (top-level or method-local) — the
+# server flagged a method-local `import traceback`. `json` is intentionally absent
+# (it is allowed method-local; module-scope json is handled by its own rule).
+_FORBIDDEN_IMPORT_MODULES = {
+    # debug / introspection / profiling (the `trace`/`traceback` family + kin)
+    "trace", "traceback", "pdb", "bdb", "cProfile", "profile", "pstats",
+    "dis", "inspect", "faulthandler", "ctypes",
+    # unsafe serialization (usage forms `pickle.` etc. are also regex-caught)
+    "pickle", "dill", "shelve", "marshal",
+    # platform internals
+    "redis", "user_config", "connection_manager",
+}
 
 
 def _lineno(text: str, pos: int) -> int:
@@ -120,6 +143,33 @@ def _toplevel_json_violations(text: str, rel: str) -> list[str]:
     return out
 
 
+def _forbidden_module_violations(text: str, rel: str) -> list[str]:
+    """Flag `import <m>` / `from <m> import ...` for any denylisted module.
+
+    Checked on the top-level package of the import and at ANY scope (the server
+    flagged a method-local `import traceback`), via AST so `import x.y`, `import x
+    as z` and `from x import y` are all covered.
+    """
+    out: list[str] = []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return out  # syntax error already surfaced elsewhere
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in _FORBIDDEN_IMPORT_MODULES:
+                    out.append(f"{rel}:{node.lineno}: forbidden module import "
+                               f"'{alias.name}' (debug/introspection/unsafe — denylisted)")
+        elif isinstance(node, ast.ImportFrom):
+            top = (node.module or "").split(".")[0]
+            if node.level == 0 and top in _FORBIDDEN_IMPORT_MODULES:
+                out.append(f"{rel}:{node.lineno}: forbidden module import "
+                           f"'from {node.module}' (debug/introspection/unsafe — denylisted)")
+    return out
+
+
 def scan_text(text: str, rel: str) -> list[str]:
     """Return violation strings ("rel:line: message") for one source string."""
     violations: list[str] = []
@@ -128,6 +178,7 @@ def scan_text(text: str, rel: str) -> list[str]:
             violations.append(f"{rel}:{_lineno(text, m.start())}: {message}")
     violations.extend(_toplevel_json_violations(text, rel))
     violations.extend(_dunder_violations(text, rel))
+    violations.extend(_forbidden_module_violations(text, rel))
     return violations
 
 

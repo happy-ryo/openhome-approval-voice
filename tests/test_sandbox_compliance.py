@@ -68,3 +68,31 @@ def test_linter_flags_dunder_attribute_access():
         "        return self.value\n"
     )
     assert scan_text(allowed, "ok.py") == []
+
+
+def test_linter_flags_forbidden_module_imports():
+    # The server rejects debug/introspection module imports ("Forbidden module
+    # import: trace" was a real upload failure from a diagnostic `import traceback`).
+    # The denylist must catch both import forms, at module AND method scope.
+    assert any("forbidden module import" in v for v in scan_text("import traceback\n", "t.py"))
+    assert any(
+        "forbidden module import" in v
+        for v in scan_text("from traceback import format_exc\n", "t.py")
+    )
+    assert any(
+        "forbidden module import" in v
+        for v in scan_text("def f():\n    import traceback\n    return traceback\n", "t.py")
+    )
+    for mod in ("trace", "pdb", "ctypes", "inspect", "pickle"):
+        assert any(
+            "forbidden module import" in v for v in scan_text(f"import {mod}\n", "t.py")
+        ), mod
+
+    # method-local json and the framework/stdlib the bundle actually uses stay OK.
+    ok = (
+        "from src.agent.capability import MatchingCapability\n"
+        "from collections.abc import Iterable\n"
+        "import logging\n"
+        "def f():\n    import json\n    return json.loads('[]')\n"
+    )
+    assert scan_text(ok, "ok.py") == []

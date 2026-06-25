@@ -569,6 +569,30 @@ seed を main.py に置くと daemon が空 queue を poll し続け、何も読
   →2 周目 dedup を確認（`build_zip` verify はパッケージ import + データ経路、本シミュレーションは
   ループ挙動）。
 
+### M3.1-s.7 サーバ側 禁止 module 一覧（実測ベース・Refs #11, 4th round）
+
+add-capability は禁止モジュールの **import** を `{"detail":"Forbidden module import: <name>"}`
+で弾く。これは static sandbox lint（os/json/open/signal/dunder）とは**別レイヤ**で、
+ローカル lint が clean でもここで落ちる。診断用に入れた `import traceback` が
+**`Forbidden module import: trace`** で弾かれて判明（method-local import でも検出される）。
+
+| 観測 / 分類 | module |
+|------|--------|
+| **実測で弾かれた** | `traceback`（エラー文言は `trace`。prefix/独立かは未確定だが両方を denylist） |
+| debug / introspection / profiling（同類として denylist） | `trace` `traceback` `pdb` `bdb` `cProfile` `profile` `pstats` `dis` `inspect` `faulthandler` `ctypes` |
+| unsafe serialization | `pickle` `dill` `shelve` `marshal` |
+| platform internal | `redis` `user_config` `connection_manager` |
+
+- 公式 doc に完全な禁止 module 一覧は**非公開**。本表は実測 + 明らかな同類から構成した
+  **denylist**で、`deploy/sandbox_lint.py` の `_FORBIDDEN_IMPORT_MODULES` に集約。
+  **新たな "Forbidden module import" 観測があればこの集合に 1 行追加するだけ**で、build_zip の
+  ビルドゲートと test が以後それを捕捉する（単一の保守点）。
+- 例外詳細のログは `traceback.format_exc()` をやめ **`repr(e)`**（= `"ExceptionType('msg')"`、
+  type 名 + message）に変更。`type(e).__name__` は **dunder 属性アクセス（§M3.1-s.1）で別途禁止**
+  なので使わない。`repr(e)` は forbidden module も dunder も踏まない。
+- **未知の禁止パターンが残存する可能性**: サーバ sandbox 仕様が非公開のため、別レイヤ（禁止
+  module / dunder / 静的パターン）でさらに発見されうる。発見ごとに対応レイヤへ denylist 追加する。
+
 ---
 
 ## 付録: 参照
