@@ -12,3 +12,6 @@ venv/
 
 # Build artifacts (deploy zips are generated, not committed)
 dist/
+
+# Exporter runtime output (live awaiting_user notes — must NOT be committed)
+.state/

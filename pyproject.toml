@@ -12,7 +12,9 @@ requires-python = ">=3.10"
 dev = ["pytest>=7"]
 
 [tool.setuptools]
-packages = ["approval_voice"]
+# approval_voice: bundled into the DevKit ability. pc_exporter: PC-side only
+# (reads claude-org state.db, serves the §1.3 queue over LAN HTTP); NOT bundled.
+packages = ["approval_voice", "pc_exporter"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
