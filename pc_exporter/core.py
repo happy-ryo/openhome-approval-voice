@@ -191,7 +191,11 @@ def _row_to_item(event_id: int, occurred_at: str, payload: dict[str, Any]) -> Op
     }
 
 
-def build_queue(conn: sqlite3.Connection) -> List[dict[str, Any]]:
+def build_queue(
+    conn: sqlite3.Connection,
+    since: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[dict[str, Any]]:
     """Read awaiting_user events from ``conn`` and return a section 1.3 array.
 
     Both predicates are required (see Refs #7): the row's ``events.kind`` is
@@ -199,12 +203,33 @@ def build_queue(conn: sqlite3.Connection) -> List[dict[str, Any]]:
     Filtering on ``events.kind='awaiting_user'`` would return zero rows. The
     payload-kind / gate filtering is done in Python (single tolerant decode)
     to avoid json_extract NULL subtleties.
+
+    ``since`` (ISO8601 string, inclusive) and ``limit`` (most-recent N) are
+    OPT-IN operator bounds, both unset by default so the spec behavior -- map
+    every notify_sent awaiting_user event -- is preserved. They exist so an
+    operator can avoid replaying the entire historical event log to a fresh
+    consumer cursor on first install / cursor reset; ``occurred_at`` is an
+    ISO8601 timestamp so a lexical ``>=`` is also chronological. NOTE: this is a
+    coarse recency bound, NOT a pending-state filter -- the thin readout reads
+    notify_sent events (which include already-resolved approvals); the accurate
+    "currently pending" source (pending_decisions) is a deferred phase. A
+    ``limit`` is therefore a count cap only and can drop genuinely-unread items
+    in a >limit backlog burst; prefer leaving it unset unless first-run replay
+    is a concrete problem.
     """
-    rows = conn.execute(
-        "SELECT id, occurred_at, payload_json FROM events "
-        "WHERE kind = 'notify_sent' "
-        "ORDER BY occurred_at, id"
-    ).fetchall()
+    if since is not None:
+        rows = conn.execute(
+            "SELECT id, occurred_at, payload_json FROM events "
+            "WHERE kind = 'notify_sent' AND occurred_at >= ? "
+            "ORDER BY occurred_at, id",
+            (since,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, occurred_at, payload_json FROM events "
+            "WHERE kind = 'notify_sent' "
+            "ORDER BY occurred_at, id"
+        ).fetchall()
     items: List[dict[str, Any]] = []
     for row in rows:
         payload = _load_payload(row["payload_json"])
@@ -213,6 +238,10 @@ def build_queue(conn: sqlite3.Connection) -> List[dict[str, Any]]:
         item = _row_to_item(int(row["id"]), row["occurred_at"], payload)
         if item is not None:
             items.append(item)
+    # limit keeps the most-recent N (chronological order preserved). <=0 / None
+    # means unlimited.
+    if limit is not None and limit > 0 and len(items) > limit:
+        items = items[-limit:]
     return items
 
 
@@ -263,13 +292,21 @@ def atomic_write_json(payload: Any, out_path: Path) -> None:
         raise
 
 
-def export_queue(db_path: Path, out_path: Path) -> int:
+def export_queue(
+    db_path: Path,
+    out_path: Path,
+    since: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> int:
     """End-to-end (a) step: read DB read-only -> build section 1.3 array ->
     atomic write to ``out_path``. Returns the number of items written.
+
+    ``since`` / ``limit`` are the opt-in recency bounds documented on
+    :func:`build_queue` (default unset = full history, preserving spec behavior).
     """
     conn = open_readonly(Path(db_path))
     try:
-        items = build_queue(conn)
+        items = build_queue(conn, since=since, limit=limit)
     finally:
         conn.close()
     atomic_write_json(items, Path(out_path))

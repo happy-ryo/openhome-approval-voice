@@ -157,6 +157,66 @@ def test_malformed_payload_tolerated(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Opt-in recency bounds (--since / --limit): default unbounded = spec behavior
+# --------------------------------------------------------------------------
+def _seed_three(db):
+    seed_state_db(db, [
+        {"occurred_at": "2026-06-26T01:00:00.000Z", "kind": "notify_sent",
+         "payload": awaiting("worker_completed", "old")},
+        {"occurred_at": "2026-06-26T02:00:00.000Z", "kind": "notify_sent",
+         "payload": awaiting("escalation_to_user", "mid")},
+        {"occurred_at": "2026-06-26T03:00:00.000Z", "kind": "notify_sent",
+         "payload": awaiting("escalation_reply_forward", "new")},
+    ])
+
+
+def test_build_queue_default_is_unbounded(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_three(db)
+    conn = core.open_readonly(db)
+    try:
+        items = core.build_queue(conn)  # no since/limit
+    finally:
+        conn.close()
+    assert [i["question"] for i in items] == ["old", "mid", "new"]
+
+
+def test_build_queue_since_filters_inclusive(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_three(db)
+    conn = core.open_readonly(db)
+    try:
+        items = core.build_queue(conn, since="2026-06-26T02:00:00.000Z")
+    finally:
+        conn.close()
+    # inclusive lower bound: the mid + new rows, not the old one
+    assert [i["question"] for i in items] == ["mid", "new"]
+
+
+def test_build_queue_limit_keeps_most_recent_chronological(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_three(db)
+    conn = core.open_readonly(db)
+    try:
+        items = core.build_queue(conn, limit=2)
+    finally:
+        conn.close()
+    # most-recent 2, still in chronological order
+    assert [i["question"] for i in items] == ["mid", "new"]
+
+
+def test_build_queue_limit_zero_is_unlimited(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_three(db)
+    conn = core.open_readonly(db)
+    try:
+        items = core.build_queue(conn, limit=0)
+    finally:
+        conn.close()
+    assert len(items) == 3
+
+
+# --------------------------------------------------------------------------
 # Contract drift guard
 # --------------------------------------------------------------------------
 def test_contract_field_set_constant():

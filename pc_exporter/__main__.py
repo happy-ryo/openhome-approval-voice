@@ -35,6 +35,19 @@ def _add_common(p: argparse.ArgumentParser) -> None:
         default=None,
         help="Output queue JSON path (default <repo_root>/.state/announce_queue.json).",
     )
+    p.add_argument(
+        "--since",
+        default=None,
+        help="Only export events with occurred_at >= this ISO8601 string "
+             "(opt-in; default: full history). Bounds first-run replay.",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Export at most the N most-recent items (opt-in; default/0: "
+             "unlimited). Count cap only, not a pending-state filter.",
+    )
 
 
 def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path]:
@@ -45,7 +58,7 @@ def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path]:
 
 def _cmd_export(args: argparse.Namespace) -> int:
     db_path, out_path = _resolve_paths(args)
-    count = export_queue(db_path, out_path)
+    count = export_queue(db_path, out_path, since=args.since, limit=args.limit)
     # ASCII-only: do not print queue values (they may be Japanese).
     print("exported %d item(s) to %s" % (count, out_path))
     return 0
@@ -56,10 +69,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     host = args.host
     port = args.port if args.port is not None else env_port()
     interval = args.interval
+    since, limit = args.since, args.limit
 
     # Export once up front so the file exists before the socket binds.
     try:
-        export_queue(db_path, out_path)
+        export_queue(db_path, out_path, since=since, limit=limit)
     except Exception as exc:  # noqa: BLE001
         print("initial export failed: %s" % exc, file=sys.stderr)
 
@@ -68,7 +82,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     def _reexport_loop() -> None:
         while not stop.wait(interval):
             try:
-                export_queue(db_path, out_path)
+                export_queue(db_path, out_path, since=since, limit=limit)
             except Exception as exc:  # noqa: BLE001
                 print("re-export failed: %s" % exc, file=sys.stderr)
 
