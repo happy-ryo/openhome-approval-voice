@@ -5,17 +5,19 @@ This is the M3 *real* replacement for the M2 mock `ApprovalVoiceAbility`
 on the DevKit, polls a persistent storage file for the announce queue, and reads
 each new `awaiting_user` gate aloud **verbatim** via `capability_worker.speak()`.
 
-STORAGE-ONLY READER (design.md §M3.3.1, push transport — Refs #7). The daemon
-**only reads its own `capability_worker` storage** (`QUEUE_STORE`); it makes NO
-outbound network call. An earlier revision pulled the queue from the PC exporter
-over an outbound HTTP GET (`urllib`), but the OpenHome add-capability sandbox was
-empirically found to **reject `urllib`** (HTTP 400 — denylisted, design.md
-§M3.1-s.7 / §M3.3.1). So the production transport is inverted: the **PC pushes**
-the §1.3 queue file into the DevKit (scp/sftp, `pc_exporter/push.py`) and this
-daemon reads whatever now sits in its storage — the unchanged read/dedup/render/
-speak pass below. The read mechanism is exactly the §M3.1 storage path; only the
-delivery direction changed (pull -> push), so nothing here imports a network
-module and the sandbox denylist can never be tripped by this file.
+LIVE PULL PRIMARY + STORAGE FALLBACK (design.md §M3.3.1, Refs #7). Each tick the
+daemon (when `PULL_ENABLED`) performs a read-only HTTP GET of the PC exporter's
+LAN endpoint (`PULL_URL`) via **`requests`** and writes the §1.3 body into its own
+`QUEUE_STORE`, then runs the unchanged read/dedup/render/speak pass below. An
+earlier revision used `urllib` for this GET, but the OpenHome add-capability
+sandbox **rejects `urllib`** (HTTP 400 — denylisted, §M3.1-s.7); `requests` is the
+**sanctioned** outbound client (accepted, HTTP 201), so the live pull is restored
+on top of it. If a pull tick fails (endpoint down / non-200 / timeout / bad body)
+storage is left untouched and the daemon re-reads whatever is already there — a
+prior pull, or a file a PC-side **push** (`pc_exporter/push.py`, the egress-failure
+fallback) delivered. With `PULL_ENABLED=False` the daemon is a pure storage-only
+reader fed solely by that push. Fallback chain: **pull -> storage -> push**, all
+converging on the one `QUEUE_STORE` read path (`_drain_queue_once`).
 
 > OPEN QUESTION (design.md §M3.3.1, requires on-device investigation): whether the
 > path the PC pushes to *is* this ability's `capability_worker` storage location
@@ -47,11 +49,12 @@ WS path treats sent text as *user speech* and the agent's LLM paraphrases a repl
 — it does NOT read the approval text verbatim. For an approval readout, paraphrase
 is a correctness risk. On-device `speak()` is direct TTS = verbatim.
 
-ONE-WAY GUARANTEE (design.md §3.1): output is `speak()` only. This module never
-captures user input, and — with the outbound GET removed — never makes ANY
-network call, so there is structurally no return channel to the PC.
+ONE-WAY GUARANTEE (design.md §3.1): output is `speak()` only, and the only network
+call is an inbound **GET** (the live pull) — the daemon never captures user input
+and never sends a body back, so there is structurally no return channel to the PC.
 `tests/test_one_way.py` AST-scans this folder; `tests/test_outbound_one_way.py`
-additionally pins that no outbound write verb (or `urlopen`/`Request`) appears.
+additionally pins that the pull stays a GET (it bans any `post`/`put`/`patch` write
+verb and a `urlopen`/`Request`/GET handed `data=`, i.e. a GET turned POST).
 `send_interrupt_signal()` before speaking also *prevents the daemon's own speech
 from being transcribed back as user input* (per OpenHome background-abilities
 docs) — a second structural guard for the one-way property.
@@ -80,6 +83,9 @@ from .approval_voice.renderer import render_speech
 from .approval_voice.sample import SAMPLE_NOTIFICATIONS, SMOKE_AUTOSEED
 from .approval_voice.storage import (
     POLL_SECONDS,
+    PULL_ENABLED,
+    PULL_TIMEOUT,
+    PULL_URL,
     QUEUE_STORE,
     SEEN_STORE,
 )
@@ -170,6 +176,60 @@ class ApprovalVoiceWatcher(MatchingCapability):
             self._log("read_aloud: speak %d/%d done" % (i, len(fresh)))
         self._log("read_aloud: end")
 
+    async def _pull_into_storage(self, tick: int) -> None:
+        """PRIMARY transport: GET the live queue from the PC exporter into storage.
+
+        design.md §M3.3.1 (A): a read-only `requests.get(PULL_URL)` against the PC
+        exporter's LAN endpoint. On HTTP 200 with a parseable §1.3 body, the body
+        is written verbatim into the daemon's own QUEUE_STORE (delete-then-write,
+        the documented pattern that avoids the append-mode corruption); the
+        unchanged _drain_queue_once pass below then renders/speaks it.
+
+        On ANY failure (endpoint down, non-200, timeout, unparseable body) this
+        logs and returns WITHOUT touching storage, so the daemon falls back to
+        whatever already sits in QUEUE_STORE — a prior successful pull, or a file a
+        PC-side **push** (pc_exporter/push.py, the egress-failure fallback)
+        delivered. Fallback chain: pull -> storage -> push, all on one read path.
+
+        One-way invariant (design.md §3.1): GET only — no body is ever sent back,
+        so this adds no return channel. `tests/test_outbound_one_way.py` AST-pins
+        that this stays a GET (it bans post/put/patch and a GET handed `data=`).
+        """
+        # method-local imports: a module-scope encode import (json) is sandbox-
+        # banned; `requests` is the sanctioned outbound client (§M3.1-s.7) and is
+        # imported here too so module load (and build_zip's import verify) needs no
+        # network dependency installed — only a live pull tick touches it.
+        import json
+
+        import requests
+
+        try:
+            resp = requests.get(PULL_URL, timeout=PULL_TIMEOUT)
+        except Exception as e:
+            # repr(e) avoids a forbidden traceback import / dunder access (§M3.1-s.7).
+            self._log("pull tick=%d: GET failed (%s) -> keep existing storage"
+                      % (tick, repr(e)))
+            return
+        if resp.status_code != 200:
+            self._log("pull tick=%d: GET status=%d -> keep existing storage"
+                      % (tick, resp.status_code))
+            return
+        raw = resp.text
+        # Validate the body parses as the §1.3 shape BEFORE persisting, so a
+        # malformed response can never overwrite a good prior queue.
+        try:
+            items = items_from_raw(json.loads(raw))
+        except Exception as e:
+            self._log("pull tick=%d: body parse failed (%s) -> keep existing storage"
+                      % (tick, repr(e)))
+            return
+        if await self.capability_worker.check_if_file_exists(QUEUE_STORE, False):
+            await self.capability_worker.delete_file(QUEUE_STORE, False)
+        await self.capability_worker.write_file(QUEUE_STORE, raw, False)
+        if tick <= 3:
+            self._log("pull tick=%d: GET 200 (%dchars, %d items) -> wrote QUEUE_STORE"
+                      % (tick, len(raw), len(items)))
+
     async def _drain_queue_once(self, tick: int) -> None:
         """One read pass: load QUEUE_STORE, speak any unread gates, persist cursor.
 
@@ -200,14 +260,17 @@ class ApprovalVoiceWatcher(MatchingCapability):
             await self._save_seen(cursor)                 # persist locally
 
     async def watch_queue(self) -> None:
-        """Infinite poll loop: read local storage -> detect unread gates -> readout.
+        """Infinite poll loop: (pull) -> read storage -> detect unread gates -> readout.
 
-        No network step: the PC-side push (pc_exporter/push.py) keeps QUEUE_STORE
-        fresh; the daemon just re-reads its own storage each tick.
+        Each tick optionally PULLS the live queue from the PC exporter into
+        QUEUE_STORE (PRIMARY transport, PULL_ENABLED), then reads QUEUE_STORE and
+        speaks any unread gates. When PULL_ENABLED is False the daemon is a pure
+        storage-only reader and relies on a PC-side push to keep QUEUE_STORE fresh
+        (the egress-failure fallback). Fallback chain: pull -> storage -> push.
         """
-        self._log("watch_queue: task started (SMOKE_AUTOSEED=%s, "
+        self._log("watch_queue: task started (SMOKE_AUTOSEED=%s, PULL_ENABLED=%s, "
                   "background_daemon_mode=%s)"
-                  % (SMOKE_AUTOSEED, self.background_daemon_mode))
+                  % (SMOKE_AUTOSEED, PULL_ENABLED, self.background_daemon_mode))
         if SMOKE_AUTOSEED:
             try:
                 await self._smoke_seed()
@@ -215,11 +278,18 @@ class ApprovalVoiceWatcher(MatchingCapability):
                 self._log("smoke autoseed error: %s" % repr(e))
         else:
             self._log("watch_queue: SMOKE_AUTOSEED is False -> no autoseed")
-        self._log("background.py ACTIVE — polling storage %s every %ss (push transport)"
-                  % (QUEUE_STORE, POLL_SECONDS))
+        transport = ("pull %s every %ss" % (PULL_URL, POLL_SECONDS)) if PULL_ENABLED \
+            else "storage-only (push transport)"
+        self._log("background.py ACTIVE — %s -> readout %s every %ss"
+                  % (transport, QUEUE_STORE, POLL_SECONDS))
         tick = 0
         while True:
             tick += 1
+            if PULL_ENABLED:
+                try:
+                    await self._pull_into_storage(tick)
+                except Exception as e:  # a bad pull must never kill the daemon
+                    self._log("pull error (tick=%d): %s" % (tick, repr(e)))
             try:
                 await self._drain_queue_once(tick)
             except Exception as e:  # never let one bad tick kill the daemon

@@ -1,3 +1,10 @@
-# approval-voice ability — stdlib only.
+# approval-voice ability dependencies.
 # The pure-logic `approval_voice` package (renderer/schema/poller/bridge) is
 # bundled into this folder at deploy time (see README), not installed via pip.
+#
+# `requests`: the SANCTIONED outbound HTTP client for the live pull primary
+# (background.py `_pull_into_storage` GETs the PC exporter; design.md §M3.3.1 (A)).
+# add-capability accepts `requests` (HTTP 201); `urllib`/`http.client`/`socket`
+# are rejected (§M3.1-s.7). The OpenHome runtime is expected to provide requests
+# (30+ shipped abilities use it); pinned loosely so the device build resolves it.
+requests>=2.25

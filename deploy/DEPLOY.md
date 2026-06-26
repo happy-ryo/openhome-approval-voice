@@ -199,17 +199,27 @@ self-seed を止めた本番では、PC 側 exporter が組織の `awaiting_user
 §1.3 キュー JSON を生成して DevKit の daemon の storage（`announce_queue.json`）へ届ける。
 daemon 側は **自 storage を読むだけ**（dedup/render/speak は不変）。届け方は 2 経路:
 
-#### (A) primary: requests HTTP pull（別トラックで実装）
+#### (A) primary: requests HTTP pull（**実装済 — branch feat/openhome-pull-primary**）
 
 > **経験則で確定（add-capability 実測）**: ability バンドルに `import requests` を入れた
 > capability は **受理された（HTTP 201）**。公式 doc / 30+ の shipped ability も `requests` を
 > sanctioned outbound として使用する。一方 `urllib` / `http.client` / `socket` は
 > **forbidden import で reject**（urllib は HTTP 400）。よって本番 primary は
 > **`requests` ベースの HTTP GET pull**（PC 側 exporter が `py -3 -m pc_exporter serve` で
-> §1.3 を LAN 配信、DevKit が GET）で、これは**別トラック / 別 PR**で実装する。
+> §1.3 を LAN 配信、DevKit が GET）。
+>
+> **実装**: `openhome_ability/background.py` の `_pull_into_storage()` が毎 poll tick で
+> `requests.get(PULL_URL)` し、200 + §1.3 parse 成功時に body を `QUEUE_STORE` へ
+> delete-then-write、その後は不変の read/dedup/render/speak。失敗（endpoint down /
+> 非200 / timeout / bad body）時は storage を触らず既存内容を読む（**fallback chain:
+> pull -> storage -> push**）。設定は `approval_voice/storage.py` の定数
+> `PULL_ENABLED`（既定 True）/ `PULL_URL`（既定 `http://192.168.2.103:8731/announce_queue.json`）/
+> `PULL_TIMEOUT`。**env でなく定数**なのは sandbox が `os` を禁止し device 側が環境変数を
+> 読めないため（PC 側 exporter は env 可）。GET のみ＝一方向不変（`test_outbound_one_way.py`）。
 >
 > ⚠️ ただし **socket 層は共有**のため、`requests` が受理されても **device 上で実際に egress
-> できるか**は別問題で、**実機 GET で初めて確定**する（≈要検証）。これが実機検証の第 1 項目。
+> できるか**は別問題で、**実機 GET で初めて確定**する（≈要検証）。これが実機検証の第 1 項目
+> （`[ApprovalVoice] pull tick=N: GET 200 ... -> wrote QUEUE_STORE` が editor log に出れば egress 成立）。
 
 #### (B) fallback: PC-side push（scp/sftp, 本 PR）
 
