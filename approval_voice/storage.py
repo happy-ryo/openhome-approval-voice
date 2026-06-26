@@ -59,7 +59,7 @@ PULL_ENABLED = True
 # PC publishes the live §1.3 queue here; the DevKit daemon GETs it. Fixed constant
 # (see above re: no env on device). Operator changes this one line if the PC LAN
 # IP/port differs from the deployment default.
-PULL_URL = "http://192.168.2.103:8731/announce_queue.json"
+PULL_URL = "http://192.168.2.103:80/announce_queue.json"
 
 # GET timeout (seconds). Short and bounded so a stalled endpoint cannot wedge the
 # poll loop; on timeout the daemon keeps the existing storage and retries next tick.

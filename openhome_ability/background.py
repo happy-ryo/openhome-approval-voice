@@ -95,6 +95,10 @@ class ApprovalVoiceWatcher(MatchingCapability):
     worker: AgentWorker = None
     capability_worker: CapabilityWorker = None
     background_daemon_mode: bool = False
+    # One-shot guard: speak the "pull reached the PC" confirmation only on the
+    # FIRST successful pull of a session (in-memory; a session restart re-arms it,
+    # which is fine — one confirmation per session is enough to verify the link).
+    _pull_confirmed: bool = False
 
     # Do not change following tag of register capability
     # {{register capability}}
@@ -242,20 +246,52 @@ class ApprovalVoiceWatcher(MatchingCapability):
             self._log("pull tick=%d: body parse failed (%s) -> keep existing storage"
                       % (tick, repr(e)))
             return
-        if await self.capability_worker.check_if_file_exists(QUEUE_STORE, False):
-            current = await self.capability_worker.read_file(QUEUE_STORE, False)
-            if current == raw:
-                if tick <= 3:
-                    self._log("pull tick=%d: GET 200 unchanged (%dchars) -> skip write"
-                              % (tick, len(raw)))
-                return
-            # delete-then-write: the documented pattern that avoids append-mode
-            # corruption on an existing storage file.
-            await self.capability_worker.delete_file(QUEUE_STORE, False)
-        await self.capability_worker.write_file(QUEUE_STORE, raw, False)
-        if tick <= 3:
-            self._log("pull tick=%d: GET 200 (%dchars, %d items) -> wrote QUEUE_STORE"
-                      % (tick, len(raw), len(items)))
+        # Persist FIRST (the critical approval path). The one-time confirmation
+        # below must never be able to drop or delay a fetched queue, so the write
+        # happens before it and the confirmation is isolated from it. Idempotent:
+        # skip the delete+write when the bytes already match what is stored
+        # (delete-then-write otherwise avoids append-mode corruption).
+        exists = await self.capability_worker.check_if_file_exists(QUEUE_STORE, False)
+        unchanged = exists and \
+            (await self.capability_worker.read_file(QUEUE_STORE, False) == raw)
+        if unchanged:
+            if tick <= 3:
+                self._log("pull tick=%d: GET 200 unchanged (%dchars) -> skip write"
+                          % (tick, len(raw)))
+        else:
+            if exists:
+                await self.capability_worker.delete_file(QUEUE_STORE, False)
+            await self.capability_worker.write_file(QUEUE_STORE, raw, False)
+            if tick <= 3:
+                self._log("pull tick=%d: GET 200 (%dchars, %d items) -> wrote QUEUE_STORE"
+                          % (tick, len(raw), len(items)))
+        # First successful pull this session: ONE audible confirmation so the
+        # operator can verify the REAL on-device daemon reached the PC (the cloud
+        # test env cannot reach the LAN PULL_URL, so this only ever speaks on the
+        # actual device). Done AFTER persistence and wrapped so a TTS/interrupt
+        # failure cannot abort the already-complete pull write. The flag is set
+        # before the attempt so a speak failure does not retry-spam every tick.
+        if not self._pull_confirmed:
+            self._pull_confirmed = True
+            try:
+                await self._speak_pull_confirmation(len(items))
+            except Exception as e:
+                self._log("pull confirm: speak failed (%s) -> continue" % repr(e))
+
+    async def _speak_pull_confirmation(self, count: int) -> None:
+        """Speak the one-time 'pull reached the PC' confirmation (interrupt + speak).
+
+        Live-integration proof: the on-device editor log is not visible to the
+        operator (the Dashboard log is OpenHome's CLOUD test env, which cannot
+        reach the LAN PULL_URL), so a real-device pull success is otherwise
+        unobservable. This audible line is the proof — if the operator hears it,
+        the actual DevKit reached the PC exporter. Output is speak() only (one-way).
+        """
+        text = "PCとの接続に成功しました。%d件の通知が取得できました。" % count
+        self._log("pull confirm: first successful pull this session -> speak (%d items)"
+                  % count)
+        await self.capability_worker.send_interrupt_signal()
+        await self.capability_worker.speak(text)
 
     async def _drain_queue_once(self, tick: int) -> None:
         """One read pass: load QUEUE_STORE, speak any unread gates, persist cursor.
