@@ -327,7 +327,7 @@ curl -sS -w '\n[HTTP %{http_code}]\n' -X POST "https://app.openhome.com/api/capa
 
 ### 4.5 live 統合の確証（pull 版・real awaiting_user gate）
 
-1. **PC**: `py -3 -m pc_exporter serve --db-path <claude-org>/.state/state.db --since <起動時刻ISO8601> --port 80`
+1. **PC**: `py -3 -m pc_exporter serve --db-path <claude-org>/.state/state.db --since <起動時刻のUTC ...Z> --port 80`
    が live state.db を `http://localhost:80/announce_queue.json` で配信中。これを **cloudflared
    quick tunnel で public HTTPS 公開**（§6.2）し、発行された `https://<random>.trycloudflare.com`
    を `PULL_URL` に埋めて ability をビルド・再アップロード（§6.3）。`--since` で歴代 `notify_sent`
@@ -475,18 +475,22 @@ cloud 実行 + cloudflared quick tunnel 構成での**毎回の起動手順**。
 ```bash
 # state.db は append-only で notify_sent イベントが累積する。--since を付けないと、
 # 再 install のたびに歴代キュー全件が再読みされ全部読み上げられてしまう。起動時刻の
-# ISO8601 を渡し、それ以降に発生した gate だけを公開する。
+# UTC ISO8601(...Z) を渡し、それ以降に発生した gate だけを公開する。
 py -3 -m pc_exporter serve \
     --db-path <claude-org>/.state/state.db \
-    --since 2026-06-26T00:00:00 \
+    --since 2026-06-26T00:00:00Z \
     --port 80
 # → "serving ... on http://0.0.0.0:80/announce_queue.json (re-export 2.0s)"
 ```
 
-> ⚠️ **`--since` は ISO8601 文字列**（`occurred_at >= ?` の SQL 比較。リテラル `now` は不可）。
-> 「今この瞬間以降だけ」にしたいなら**起動時の現在時刻を ISO8601 で**渡す
-> （例 `2026-06-26T09:30:00`）。省略すると**全歴代**が対象になる（first-run replay を招く）。
-> `--port 80` は cloudflared を `http://localhost:80` に向ける都合（§6.2）。
+> ⚠️ **`--since` は `occurred_at` と同じ UTC `...Z` 形式で渡す**。フィルタは
+> `occurred_at >= ?` の **辞書順（文字列）比較**で、DB の `occurred_at` は UTC + `Z` 接尾辞
+> （例 `2026-06-26T01:00:00.000Z`）で格納される。**ローカル時刻（例 JST）の文字列を渡すと
+> UTC 値より先行**し、新しく emit された gate が「UTC が追いつくまで」除外される事故になる。
+> 必ず **UTC で現在時刻**を生成する（例 PowerShell: `(Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")`、
+> bash: `date -u +%Y-%m-%dT%H:%M:%SZ`）。リテラル `now` は不可（ISO8601 文字列のみ）。
+> 省略すると**全歴代**が対象になる（first-run replay を招く）。`--port 80` は cloudflared を
+> `http://localhost:80` に向ける都合（§6.2）。
 
 ### 6.2 cloudflared quick tunnel を起動（public HTTPS 発行）
 
