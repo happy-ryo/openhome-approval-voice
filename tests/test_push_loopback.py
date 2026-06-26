@@ -302,11 +302,12 @@ def test_push_loopback_idempotent_redelivery_then_new_gate(tmp_path):
     assert watcher.capability_worker.interrupts == 2  # one interrupt per readout batch
 
 
-def test_watch_queue_reads_pushed_storage_no_network(tmp_path):
-    # Drive the REAL daemon entry (watch_queue), not just _drain_queue_once: with
-    # SMOKE_AUTOSEED off the loop must read whatever the PC pushed into QUEUE_STORE
-    # and NOT touch the network (the storage-only reader contract). This is the
+def test_watch_queue_reads_pushed_storage_no_network(tmp_path, monkeypatch):
+    # Drive the REAL daemon entry (watch_queue), not just _drain_queue_once: in the
+    # storage-only / push-fallback mode (PULL_ENABLED False) the loop must read
+    # whatever the PC pushed into QUEUE_STORE and NOT touch the network. This is the
     # coverage the deleted test_live_pull.py used to give the loop body.
+    monkeypatch.setattr(background, "PULL_ENABLED", False)  # storage-only mode
     db = tmp_path / "state.db"
     _seed_five_gate_db(db)
     local_queue = tmp_path / "announce_queue.json"
@@ -332,6 +333,7 @@ def test_watch_queue_self_seeds_when_smoke_autoseed_on(tmp_path, monkeypatch):
     # seeds the 4-gate sample into its own storage on startup and reads it -- no
     # push, no network, no trigger. Pins the self-seed branch of watch_queue.
     monkeypatch.setattr(background, "SMOKE_AUTOSEED", True)
+    monkeypatch.setattr(background, "PULL_ENABLED", False)  # self-seed smoke, no pull
 
     watcher = _make_watcher(ticks=1)
     assert QUEUE_STORE not in watcher.capability_worker.storage  # empty at start
