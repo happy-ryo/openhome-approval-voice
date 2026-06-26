@@ -609,12 +609,15 @@ add-capability は禁止モジュールの **import** を `{"detail":"Forbidden 
 - 例外詳細のログは `traceback.format_exc()` をやめ **`repr(e)`**（= `"ExceptionType('msg')"`、
   type 名 + message）に変更。`type(e).__name__` は **dunder 属性アクセス（§M3.1-s.1）で別途禁止**
   なので使わない。`repr(e)` は forbidden module も dunder も踏まない。
-- **network egress と push fallback の確定知見（Refs #7）**: 上表の通り `urllib` / `http.client` /
-  `socket` は実測 reject、`requests` は実測 sanctioned（HTTP 201）。よって ability 側は **outbound を
-  完全撤去した storage-only reader** とし、bundle に network import を一切持たせない（denylist を構造的に
-  回避）。production transport は **PC→DevKit の push（`pc_exporter/push.py`, paramiko SFTP）を egress-failure
-  の正式 fallback** として実装済み。`requests` ベースの HTTP pull primary はこの sanctioned 判定に基づく別
-  トラック。詳細・実測根拠は §M3.3.1 の「訂正・更新（add-capability 実測, Refs #7）」を参照。
+- **network egress / pull primary / push fallback の確定知見（Refs #7）**: 上表の通り `urllib` /
+  `http.client` / `socket` は実測 reject、`requests` は実測 sanctioned（HTTP 201）。この sanctioned
+  判定に基づき **production primary = `requests` HTTP pull**（`openhome_ability/background.py` の
+  `_pull_into_storage()` が PC exporter の LAN endpoint を GET → `QUEUE_STORE` へ書込、branch
+  `feat/openhome-pull-primary` で実装）。pull が device で通らない場合の **正式 fallback = PC→DevKit
+  push**（`pc_exporter/push.py`, paramiko SFTP）。**fallback chain: pull -> storage -> push** が同一
+  `QUEUE_STORE` read path に収束。GET のみ＝write-back 無し（一方向不変, `test_outbound_one_way.py`）。
+  pull URL/flag は **env でなく storage.py の定数**（device が `os` 禁止で環境変数を読めないため）。
+  詳細・実測根拠は §M3.3.1 の「訂正・更新（add-capability 実測, Refs #7）」を参照。
 - **docstring / コメントも含めた raw-text スキャン**: `deploy/sandbox_lint.py` の regex ルール群は AST では
   なく **raw source（docstring・コメント込み）** に適用する。SDK Reference が低レベル signal 規則を
   「docstring/コメント内でも適用」と明記しているため、安全側の posture として **禁止リテラルを bundle 内の

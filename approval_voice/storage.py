@@ -27,11 +27,40 @@ SEEN_STORE = "announce_seen.json"
 # the sandbox forbids. 10-30s is the documented norm.
 POLL_SECONDS = 15.0
 
-# NOTE (design.md §M3.3.1, Refs #7): there is intentionally NO announce-source
-# URL here. An earlier revision had the daemon GET the queue from the PC exporter
-# over `urllib`, but the OpenHome add-capability sandbox was found to reject
-# `urllib` (HTTP 400 — denylisted, §M3.1-s.7). The production transport is now a
-# **PC-side push** (`pc_exporter/push.py` scp/sftp's the §1.3 queue file into the
-# DevKit); the daemon makes no network call and simply reads whatever now sits in
-# QUEUE_STORE. So this module holds only storage names + the poll interval — no
-# network config, which also keeps the bundle clear of the sandbox denylist.
+# --- live pull transport (production PRIMARY, design.md §M3.3.1 (A), Refs #7) ---
+#
+# These are plain module constants on purpose, NOT environment variables: the
+# OpenHome add-capability sandbox forbids the `os` module (platform access), so the
+# on-device ability literally cannot read process environment variables. A config
+# value the ability consumes must therefore be a constant here (the same reason
+# POLL_SECONDS / SMOKE_AUTOSEED are constants). The PC-side exporter, which is NOT
+# sandboxed, still takes its bind host/port from the environment — only the
+# device-side consumer is pinned to a constant.
+#
+# (This comment deliberately avoids the literal `os` dot-attribute token: the
+# sandbox lint regex-scans comments too, so naming the attribute would self-trip.)
+#
+# When PULL_ENABLED is True the daemon performs a read-only `requests.get` of
+# PULL_URL each tick and writes the §1.3 body into QUEUE_STORE, then runs the
+# unchanged read/dedup/render/speak pass. `requests` is the SANCTIONED outbound
+# client (add-capability accepts it, HTTP 201; `urllib`/`http.client`/`socket` are
+# rejected — §M3.1-s.7). The fetch is GET-only, so no body is ever sent back and
+# the one-way invariant holds (tests/test_outbound_one_way.py allows GET, bans
+# post/put/patch and GET-turned-POST).
+#
+# Fallback chain (design.md §M3.3.1): pull -> storage -> push. A failed pull
+# (endpoint down, non-200, timeout, bad body) does NOT touch storage, so the
+# daemon simply re-reads whatever is already in QUEUE_STORE — which a PC-side
+# **push** (pc_exporter/push.py, the egress-failure fallback) may have delivered.
+# All three transports converge on the same QUEUE_STORE read path.
+PULL_ENABLED = True
+
+# PC exporter LAN endpoint (pc_exporter serve, design.md §M3.3.1 (A)). The org's
+# PC publishes the live §1.3 queue here; the DevKit daemon GETs it. Fixed constant
+# (see above re: no env on device). Operator changes this one line if the PC LAN
+# IP/port differs from the deployment default.
+PULL_URL = "http://192.168.2.103:8731/announce_queue.json"
+
+# GET timeout (seconds). Short and bounded so a stalled endpoint cannot wedge the
+# poll loop; on timeout the daemon keeps the existing storage and retries next tick.
+PULL_TIMEOUT = 5.0

@@ -199,17 +199,27 @@ self-seed を止めた本番では、PC 側 exporter が組織の `awaiting_user
 §1.3 キュー JSON を生成して DevKit の daemon の storage（`announce_queue.json`）へ届ける。
 daemon 側は **自 storage を読むだけ**（dedup/render/speak は不変）。届け方は 2 経路:
 
-#### (A) primary: requests HTTP pull（別トラックで実装）
+#### (A) primary: requests HTTP pull（**実装済 — branch feat/openhome-pull-primary**）
 
 > **経験則で確定（add-capability 実測）**: ability バンドルに `import requests` を入れた
 > capability は **受理された（HTTP 201）**。公式 doc / 30+ の shipped ability も `requests` を
 > sanctioned outbound として使用する。一方 `urllib` / `http.client` / `socket` は
 > **forbidden import で reject**（urllib は HTTP 400）。よって本番 primary は
 > **`requests` ベースの HTTP GET pull**（PC 側 exporter が `py -3 -m pc_exporter serve` で
-> §1.3 を LAN 配信、DevKit が GET）で、これは**別トラック / 別 PR**で実装する。
+> §1.3 を LAN 配信、DevKit が GET）。
+>
+> **実装**: `openhome_ability/background.py` の `_pull_into_storage()` が毎 poll tick で
+> `requests.get(PULL_URL)` し、200 + §1.3 parse 成功時に body を `QUEUE_STORE` へ
+> delete-then-write、その後は不変の read/dedup/render/speak。失敗（endpoint down /
+> 非200 / timeout / bad body）時は storage を触らず既存内容を読む（**fallback chain:
+> pull -> storage -> push**）。設定は `approval_voice/storage.py` の定数
+> `PULL_ENABLED`（既定 True）/ `PULL_URL`（既定 `http://192.168.2.103:8731/announce_queue.json`）/
+> `PULL_TIMEOUT`。**env でなく定数**なのは sandbox が `os` を禁止し device 側が環境変数を
+> 読めないため（PC 側 exporter は env 可）。GET のみ＝一方向不変（`test_outbound_one_way.py`）。
 >
 > ⚠️ ただし **socket 層は共有**のため、`requests` が受理されても **device 上で実際に egress
-> できるか**は別問題で、**実機 GET で初めて確定**する（≈要検証）。これが実機検証の第 1 項目。
+> できるか**は別問題で、**実機 GET で初めて確定**する（≈要検証）。これが実機検証の第 1 項目
+> （`[ApprovalVoice] pull tick=N: GET 200 ... -> wrote QUEUE_STORE` が editor log に出れば egress 成立）。
 
 #### (B) fallback: PC-side push（scp/sftp, 本 PR）
 
@@ -254,6 +264,47 @@ py -3 -m pc_exporter push \
 > 共有マウント（DevKit 側で PC 共有を mount し、storage 実体をそのマウント配下に置けるか）や
 > requests pull（primary）へ寄せる。本 PR の push.py は **transport のみ**を提供し、`--target` が
 > 指す場所へファイルを確実に届けるところまでを保証する。
+
+### 4.4 既存 capability を pull 版へ更新する（capability_id=6393 想定）
+
+pull primary 実装（`feat/openhome-pull-primary`）を、既に作成済み・山彦(590628)へ install/enable
+済みの capability **6393** へ反映する手順。**新 capability を作り直さず in-place で新バージョン化**する
+（install/enable と personality 紐付けを維持）。
+
+> ⚠️ **認証の差（実測ベース）**: `add-capability` は **X-API-KEY** で通った（HTTP 201, 6393 作成）。
+> 一方 **`edit-capability` / `get-all-capabilities` / `enable/release` は JWT Bearer 必須**の実測報告が
+> ある（先行 worker: X-API-KEY で 401）。**まず X-API-KEY を試し、401 なら**ダッシュボード
+> （app.openhome.com）DevTools → Network の `Authorization: Bearer <token>`（短命）を inline で使う。
+> worker は外部 POST 不可（classifier）なので、以下は **user/窓口が `!` 経由で実行**する。
+
+```bash
+# zip は本 worktree の dist/approval-voice-ability.zip（pull 版で再ビルド済）。
+export AUTH='Authorization: Bearer <DevToolsのBearer>'   # 401 時。X-API-KEY 可ならそちらでも可
+ZIP=/c/Users/iwama/Documents/work/org/workers/openhome-approval-voice/.worktrees/openhome-push-transport/dist/approval-voice-ability.zip
+
+# STEP U: 新バージョン作成（非破壊 PUT）。成功=HTTP 200。400=sandbox 新ルール（本文 token を sandbox_lint へ）
+curl -sS -w '\n[HTTP %{http_code}]\n' -X PUT "https://app.openhome.com/api/capabilities/edit-capability/6393/" \
+  -H "$AUTH" -F "name=approvalvoice" -F "category=background_daemon" -F "zip_file=@${ZIP}"
+
+# STEP V: 反映確認。6393 の capability_versions で id 最大(最新版)の is_user_enabled を見る
+curl -sS "https://app.openhome.com/api/capabilities/get-all-capabilities/" -H "$AUTH"
+
+# STEP W: 最新版が is_user_enabled=false のときだけ（version 単位 enable, body 不要）
+curl -sS -w '\n[HTTP %{http_code}]\n' -X POST "https://app.openhome.com/api/capabilities/enable/release/<最新version_id>/" -H "$AUTH"
+# 404/405 なら代替: PUT edit-installed-capability/6393/ -F "enabled=true" -F "category=background_daemon"
+```
+
+### 4.5 live 統合の確証（pull 版・real awaiting_user gate）
+
+1. **PC**: `py -3 -m pc_exporter serve --db-path <claude-org>/.state/state.db` が live state.db を
+   `http://192.168.2.103:8731/announce_queue.json` で配信中（FW 8731 inbound 解放済）。
+2. **real gate を 1 件 emit**（組織側、例）: `awaiting_user` イベントを state.db に記録 → exporter が即時公開。
+3. **DevKit**: 山彦のセッションを（再）開始 → daemon 起動 → 毎 tick `requests.get` で pull。
+4. **確証ログ**（"Open In Editor" → log タブ）:
+   - `[ApprovalVoice] watch_queue: task started (... PULL_ENABLED=True ...)`
+   - `[ApprovalVoice] pull tick=1: GET 200 (Nchars, M items) -> wrote QUEUE_STORE`  ← **egress 成立**
+   - `[ApprovalVoice] poll tick=1: ... fresh=M` → `read_aloud: speak ...`（**non-SMOKE な real gate を逐語**）
+   - `pull tick=N: GET failed/status=...` が出るなら egress 不可 → push fallback（§4.3 B）へ。
 
 ---
 
