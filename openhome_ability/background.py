@@ -99,6 +99,11 @@ class ApprovalVoiceWatcher(MatchingCapability):
     # FIRST successful pull of a session (in-memory; a session restart re-arms it,
     # which is fine — one confirmation per session is enough to verify the link).
     _pull_confirmed: bool = False
+    # One-shot guard: speak the daemon-startup announcement once when watch_queue
+    # begins (in-memory; re-arms on restart). Pairs with _pull_confirmed to make
+    # three states audible: silence = daemon never loaded; startup line only =
+    # daemon up but pull failing; startup + confirmation = live integration.
+    _startup_announced: bool = False
 
     # Do not change following tag of register capability
     # {{register capability}}
@@ -322,6 +327,21 @@ class ApprovalVoiceWatcher(MatchingCapability):
             cursor.mark_read(fresh)
             await self._save_seen(cursor)                 # persist locally
 
+    async def _speak_startup_announcement(self) -> None:
+        """Speak the one-time daemon-startup announcement (interrupt + speak).
+
+        Spoken once when watch_queue begins. Because the on-device log is not
+        visible to the operator (the Dashboard log is OpenHome's CLOUD test env),
+        this audible line is how the operator knows the daemon actually LOADED on
+        the real device — distinct from the later pull confirmation. The two
+        together make three states audible (silence / startup-only / startup+
+        confirmation; see _startup_announced). Output is speak() only (one-way).
+        """
+        text = "approvalvoice デーモンが起動しました。PC との接続を確認中です。"
+        self._log("startup: daemon started -> speak startup announcement")
+        await self.capability_worker.send_interrupt_signal()
+        await self.capability_worker.speak(text)
+
     async def watch_queue(self) -> None:
         """Infinite poll loop: (pull) -> read storage -> detect unread gates -> readout.
 
@@ -334,6 +354,15 @@ class ApprovalVoiceWatcher(MatchingCapability):
         self._log("watch_queue: task started (SMOKE_AUTOSEED=%s, PULL_ENABLED=%s, "
                   "background_daemon_mode=%s)"
                   % (SMOKE_AUTOSEED, PULL_ENABLED, self.background_daemon_mode))
+        # One-time audible proof that the daemon loaded on the real device, spoken
+        # BEFORE any seed/pull branch and ISOLATED so a startup-speak failure can
+        # never prevent the poll loop from running.
+        if not self._startup_announced:
+            self._startup_announced = True
+            try:
+                await self._speak_startup_announcement()
+            except Exception as e:
+                self._log("startup announcement failed (%s) -> continue" % repr(e))
         if SMOKE_AUTOSEED:
             try:
                 await self._smoke_seed()

@@ -83,6 +83,9 @@ import json  # noqa: E402
 # Prefix of the one-time "pull reached the PC" confirmation utterance
 # (background._speak_pull_confirmation). Match by prefix so the count suffix varies.
 CONFIRM_PREFIX = "PCとの接続に成功しました"
+# Prefix of the one-time daemon-startup announcement (watch_queue start). It is
+# spoken before any seed/pull/readout, so in a watch_queue run it is cw.spoken[0].
+STARTUP_PREFIX = "approvalvoice デーモンが起動しました"
 
 
 # --- fakes (mirror test_push_loopback.py) ---------------------------------
@@ -328,9 +331,11 @@ def test_watch_queue_pull_primary_end_to_end(monkeypatch):
     cw = watcher.capability_worker
     assert cw.storage[QUEUE_STORE] == body         # pulled into storage
     assert {i["gate"] for i in json.loads(cw.storage[QUEUE_STORE])} == set(GATES)
-    assert cw.spoken[0].startswith(CONFIRM_PREFIX)  # confirmation first
-    assert len(cw.spoken[1:]) == 4                   # then the pulled gates, once
-    assert cw.interrupts == 2                         # confirmation + readout batch
+    # watch_queue speaks: [startup announcement, pull confirmation, 4 gates].
+    assert cw.spoken[0].startswith(STARTUP_PREFIX)  # startup first
+    assert cw.spoken[1].startswith(CONFIRM_PREFIX)  # then pull confirmation
+    assert len(cw.spoken[2:]) == 4                   # then the pulled gates, once
+    assert cw.interrupts == 3                         # startup + confirmation + readout
     assert [c[0] for c in fake.calls] == ["get"]    # GET only (one-way)
 
 
@@ -349,8 +354,10 @@ def test_watch_queue_pull_disabled_is_storage_only(monkeypatch):
     _run_watch_queue(watcher)
     cw = watcher.capability_worker
     assert fake.calls == []                          # no network when pull disabled
-    assert len(cw.spoken) == 4                       # read from pushed storage
-    # The pull confirmation is pull-path only: storage-only mode never speaks it.
+    # Startup announcement still fires (it is daemon-load proof, pull-independent),
+    # then the gates from pushed storage. The pull CONFIRMATION does not (pull-only).
+    assert cw.spoken[0].startswith(STARTUP_PREFIX)
+    assert len(cw.spoken[1:]) == 4                    # read from pushed storage
     assert not any(l.startswith(CONFIRM_PREFIX) for l in cw.spoken)
     assert watcher._pull_confirmed is False
 
@@ -394,3 +401,59 @@ def test_confirmation_fires_even_when_body_empty(monkeypatch):
     cw = watcher.capability_worker
     assert cw.spoken and cw.spoken[0].startswith(CONFIRM_PREFIX)
     assert "0件" in cw.spoken[0]
+
+
+# --- daemon-startup announcement ------------------------------------------
+def test_watch_queue_speaks_startup_announcement(monkeypatch):
+    # The daemon-load proof: watch_queue speaks the startup line once, FIRST,
+    # before any pull/seed/readout. Pull disabled here so only startup speaks.
+    monkeypatch.setattr(background, "PULL_ENABLED", False)
+    monkeypatch.setattr(background, "SMOKE_AUTOSEED", False)
+    fake = _FakeRequests(status_code=200, text=_sample_body())
+    _install_fake_requests(monkeypatch, fake)
+
+    watcher = _make_watcher(ticks=1)  # empty storage, nothing to read
+    _run_watch_queue(watcher)
+    cw = watcher.capability_worker
+
+    assert cw.spoken == [m for m in cw.spoken if m]   # sanity
+    assert cw.spoken[0].startswith(STARTUP_PREFIX)
+    assert sum(1 for m in cw.spoken if m.startswith(STARTUP_PREFIX)) == 1
+    assert watcher._startup_announced is True
+    assert fake.calls == []                            # pull disabled -> no GET
+
+
+def test_watch_queue_speaks_startup_announcement_once_across_ticks(monkeypatch):
+    monkeypatch.setattr(background, "PULL_ENABLED", False)
+    monkeypatch.setattr(background, "SMOKE_AUTOSEED", False)
+    watcher = _make_watcher(ticks=3)   # three poll iterations
+    _run_watch_queue(watcher)
+    cw = watcher.capability_worker
+    # Spoken once total despite three ticks (watch_queue runs it before the loop).
+    assert sum(1 for m in cw.spoken if m.startswith(STARTUP_PREFIX)) == 1
+
+
+class _StartupSpeakFailsWorker(_FakeCapabilityWorker):
+    """Raises on the startup utterance only; gate readouts still succeed."""
+
+    async def speak(self, text):
+        if text.startswith(STARTUP_PREFIX):
+            raise RuntimeError("tts device not ready")
+        await super().speak(text)
+
+
+def test_watch_queue_runs_even_if_startup_speak_fails(monkeypatch):
+    # A startup-speak failure must be isolated: the poll loop still reads storage
+    # and speaks the gates (the startup line is non-critical telemetry).
+    monkeypatch.setattr(background, "PULL_ENABLED", False)
+    monkeypatch.setattr(background, "SMOKE_AUTOSEED", False)
+
+    watcher = _make_watcher(ticks=1)
+    watcher.capability_worker = _StartupSpeakFailsWorker()
+    watcher.capability_worker.storage[QUEUE_STORE] = _sample_body()  # pushed queue
+
+    _run_watch_queue(watcher)                # must not raise
+    cw = watcher.capability_worker
+    assert watcher._startup_announced is True            # flag set despite failure
+    assert not any(m.startswith(STARTUP_PREFIX) for m in cw.spoken)  # startup dropped
+    assert len(cw.spoken) == 4               # but the gates still read aloud
