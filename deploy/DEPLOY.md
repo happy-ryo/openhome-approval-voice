@@ -478,7 +478,7 @@ cloud 実行 + cloudflared quick tunnel 構成での**毎回の起動手順**。
 # UTC ISO8601(...Z) を渡し、それ以降に発生した gate だけを公開する。
 py -3 -m pc_exporter serve \
     --db-path <claude-org>/.state/state.db \
-    --since 2026-06-26T00:00:00Z \
+    --since 2026-06-26T00:00:00.000Z \
     --port 80
 # → "serving ... on http://0.0.0.0:80/announce_queue.json (re-export 2.0s)"
 ```
@@ -487,8 +487,12 @@ py -3 -m pc_exporter serve \
 > `occurred_at >= ?` の **辞書順（文字列）比較**で、DB の `occurred_at` は UTC + `Z` 接尾辞
 > （例 `2026-06-26T01:00:00.000Z`）で格納される。**ローカル時刻（例 JST）の文字列を渡すと
 > UTC 値より先行**し、新しく emit された gate が「UTC が追いつくまで」除外される事故になる。
-> 必ず **UTC で現在時刻**を生成する（例 PowerShell: `(Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")`、
-> bash: `date -u +%Y-%m-%dT%H:%M:%SZ`）。リテラル `now` は不可（ISO8601 文字列のみ）。
+> 必ず **UTC で現在時刻**を生成し、`occurred_at` と**同じ小数秒つき `...sssZ` 形**にする
+> （例 PowerShell: `(Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")`、
+> bash: `date -u +%Y-%m-%dT%H:%M:%S.000Z`）。秒精度どまり（`...ssZ`）だと、辞書順比較で
+> `.`(0x2E) が `Z`(0x5A) より小さいため **同じ秒に格納された小数秒つきイベント
+> （`...00.500Z`）が `...00Z` 未満と判定されて落ちる**。小数秒は `.000Z` で十分（その秒の
+> イベントを取りこぼさない安全側）。リテラル `now` は不可（ISO8601 文字列のみ）。
 > 省略すると**全歴代**が対象になる（first-run replay を招く）。`--port 80` は cloudflared を
 > `http://localhost:80` に向ける都合（§6.2）。
 
