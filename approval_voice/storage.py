@@ -27,26 +27,11 @@ SEEN_STORE = "announce_seen.json"
 # the sandbox forbids. 10-30s is the documented norm.
 POLL_SECONDS = 15.0
 
-# Outbound announce source (design.md §M3.3.1 / §M3.1-s.5) — the live PC->DevKit
-# pull. When set, the daemon GETs this URL every poll and writes the response to
-# QUEUE_STORE before the normal read/dedup/render/speak pass (one-way: GET only,
-# never a write-back to the PC). None = disabled: the daemon reads only what is
-# already in its own storage (the M3.1 self-seed smoke path).
-#
-# Set it to the PC exporter URL to enable the live pull, e.g.
-#   ANNOUNCE_SOURCE_URL = "http://192.168.1.20:8000/announce_queue.json"
-# It is NOT hardcoded to a host: this single named constant is the one config
-# point (an env var would need os.*, which the sandbox forbids — §M3.1-s.1). Only
-# http(s) is honored (approval_voice/source.py rejects file://-style URLs so the
-# pull can never become a local-file read).
-ANNOUNCE_SOURCE_URL = None
-
-# Per-fetch HTTP timeout (seconds). Kept well under POLL_SECONDS so an asleep or
-# unreachable PC pauses the daemon only briefly before the tick is skipped (the
-# blocking GET freezes the event loop up to this long — see background.py).
-FETCH_TIMEOUT_SECONDS = 5.0
-
-# Upper bound on a fetched queue body (bytes). The announce queue is a handful of
-# short gates, so 1 MiB is generous; a misconfigured URL returning a huge / HTML
-# 200 is treated as a failed fetch (skipped tick) rather than read into memory.
-MAX_FETCH_BYTES = 1_048_576
+# NOTE (design.md §M3.3.1, Refs #7): there is intentionally NO announce-source
+# URL here. An earlier revision had the daemon GET the queue from the PC exporter
+# over `urllib`, but the OpenHome add-capability sandbox was found to reject
+# `urllib` (HTTP 400 — denylisted, §M3.1-s.7). The production transport is now a
+# **PC-side push** (`pc_exporter/push.py` scp/sftp's the §1.3 queue file into the
+# DevKit); the daemon makes no network call and simply reads whatever now sits in
+# QUEUE_STORE. So this module holds only storage names + the poll interval — no
+# network config, which also keeps the bundle clear of the sandbox denylist.

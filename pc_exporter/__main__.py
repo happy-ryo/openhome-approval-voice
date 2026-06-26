@@ -5,9 +5,14 @@ Subcommands:
   export   read state.db read-only, write the section 1.3 queue JSON once.
   serve    periodically re-export (background thread) and serve the file over
            a minimal one-way HTTP server on the LAN.
+  push     periodically re-export and PUSH the queue file onto the DevKit over
+           scp/sftp (the transport used when the on-device ability cannot make
+           outbound HTTP -- urllib is sandbox-denylisted; design.md M3.3.1).
 
 Run as: python -m pc_exporter export --db-path <claude-org>/.state/state.db
         python -m pc_exporter serve   --db-path <claude-org>/.state/state.db
+        python -m pc_exporter push    --db-path <claude-org>/.state/state.db \
+            --target user@devkit:/data/approvalvoice/announce_queue.json
 
 All help / print strings are ASCII only (cp932 console safety). Queue values
 (possibly Japanese) are written to a utf-8 file and served as raw bytes; they
@@ -18,9 +23,11 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
+import time
 from pathlib import Path
 
 from .core import default_out_path, export_queue, resolve_db_path
+from .push import PushState, make_transport, parse_target, push_with_backoff
 from .server import DEFAULT_HOST, env_port, make_server
 
 
@@ -108,6 +115,93 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_push(args: argparse.Namespace) -> int:
+    db_path, out_path = _resolve_paths(args)
+    since, limit = args.since, args.limit
+    try:
+        target = parse_target(args.target, port=args.port)
+    except ValueError as exc:
+        print("bad --target: %s" % exc, file=sys.stderr)
+        return 2
+
+    # Export once up front so a startup misconfig (bad --db-path) fails fast
+    # before we open an SSH connection -- same posture as serve.
+    try:
+        export_queue(db_path, out_path, since=since, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        print("initial export failed (not pushing): %s" % exc, file=sys.stderr)
+        return 2
+
+    ssh_kwargs = {}
+    if not target.is_local:
+        if args.identity:
+            ssh_kwargs["key_filename"] = args.identity
+
+    # Connect once up front so a real misconfig (bad host/key/missing paramiko)
+    # fails fast with a clear exit code, rather than being retried forever as if
+    # it were a transient blip.
+    try:
+        transport = make_transport(target, **ssh_kwargs)
+    except Exception as exc:  # noqa: BLE001 - connect / missing paramiko
+        print("transport setup failed: %s" % exc, file=sys.stderr)
+        return 2
+
+    where = target.path if target.is_local else "%s:%s" % (target.host, target.path)
+    print("pushing %s -> %s (re-export %.1fs, target=%s)"
+          % (out_path, where, args.interval, "local" if target.is_local else "ssh"))
+
+    state = PushState()
+
+    def _log(msg: str) -> None:
+        # ASCII only (queue values are never logged here).
+        print(msg)
+
+    # Holder so a failed round can drop a dead connection and the next round can
+    # rebuild it. paramiko does NOT auto-reopen a closed SFTP channel, so a DevKit
+    # reboot / Wi-Fi drop would otherwise wedge the loop on a dead transport
+    # forever. `None` means "reconnect before the next push".
+    holder = {"transport": transport}
+
+    def _ensure_transport():
+        if holder["transport"] is None:
+            holder["transport"] = make_transport(target, **ssh_kwargs)
+        return holder["transport"]
+
+    def _drop_transport() -> None:
+        t = holder["transport"]
+        holder["transport"] = None
+        if t is not None:
+            try:
+                t.close()
+            except Exception:  # noqa: BLE001 - already-dead channel close is moot
+                pass
+
+    def _one_round() -> None:
+        export_queue(db_path, out_path, since=since, limit=limit)
+        push_with_backoff(out_path, target.path, _ensure_transport(), state,
+                          attempts=args.attempts, log=_log)
+
+    try:
+        if args.once:
+            _one_round()
+            return 0
+        while True:
+            try:
+                _one_round()
+            except Exception as exc:  # noqa: BLE001 - keep looping on a bad round
+                # The connection may be dead (reboot/Wi-Fi); drop it so the next
+                # round reconnects instead of reusing a closed channel forever.
+                _drop_transport()
+                print("push round failed (will reconnect next interval): %s" % exc,
+                      file=sys.stderr)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("shutting down")
+        return 0
+    finally:
+        _drop_transport()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m pc_exporter",
@@ -139,6 +233,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds between re-exports (default 2.0).",
     )
     p_serve.set_defaults(func=_cmd_serve)
+
+    p_push = sub.add_parser(
+        "push", help="Periodically re-export and push the queue file to the DevKit.")
+    _add_common(p_push)
+    p_push.add_argument(
+        "--target",
+        required=True,
+        help="Destination: user@host:/remote/path (scp/sftp) or a local path "
+             "(no host: -> local copy, e.g. a mounted share or a test dir).",
+    )
+    p_push.add_argument(
+        "--port",
+        type=int,
+        default=22,
+        help="SSH port for a remote target (default 22).",
+    )
+    p_push.add_argument(
+        "--identity",
+        default=None,
+        help="SSH private key file (default: SSH agent + ~/.ssh default keys).",
+    )
+    p_push.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Seconds between re-export+push rounds (default 2.0).",
+    )
+    p_push.add_argument(
+        "--attempts",
+        type=int,
+        default=5,
+        help="Max transfer attempts per round with exponential backoff (default 5).",
+    )
+    p_push.add_argument(
+        "--once",
+        action="store_true",
+        help="Export and push a single time, then exit (no loop).",
+    )
+    p_push.set_defaults(func=_cmd_push)
     return parser
 
 

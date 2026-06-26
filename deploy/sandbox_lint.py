@@ -95,6 +95,20 @@ _FORBIDDEN_IMPORT_MODULES = {
     "pickle", "dill", "shelve", "marshal",
     # platform internals
     "redis", "user_config", "connection_manager",
+    # network egress. `urllib`, `http` (http.client) and `socket` are OBSERVED
+    # add-capability rejections (urllib -> HTTP 400; the empirical probe confirmed
+    # urllib / http.client / socket are all rejected as forbidden imports;
+    # design.md M3.3.1 / M3.1-s.7) -- which is why THIS ability is a storage-only
+    # reader and the production transport is a PC-side push (pc_exporter/push.py).
+    # The TLS/legacy-protocol siblings are PREVENTIVE (not individually confirmed).
+    #
+    # DELIBERATELY NOT denylisted: `requests`. The empirical probe found `requests`
+    # is SANCTIONED -- a bundle importing it was accepted (HTTP 201), and 30+
+    # shipped abilities use it for outbound. The sanctioned `requests` HTTP pull is
+    # the production PRIMARY (handled on a separate track); this push transport is
+    # its official egress-failure fallback. Denylisting `requests` here would break
+    # that track, so it (and its httpx/aiohttp peers) are intentionally allowed.
+    "urllib", "urllib3", "http", "socket", "ssl", "ftplib", "telnetlib", "smtplib",
 }
 
 

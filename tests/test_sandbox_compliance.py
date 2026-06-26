@@ -98,6 +98,32 @@ def test_linter_flags_forbidden_module_imports():
     assert scan_text(ok, "ok.py") == []
 
 
+def test_linter_flags_network_egress_imports():
+    # `urllib` is an OBSERVED add-capability rejection (HTTP 400) -- this is why
+    # the outbound-GET live-pull was replaced by a PC-side push (design.md
+    # M3.3.1 / M3.1-s.7). The denylist must catch it (and its preventive egress
+    # siblings) at module AND method scope, in both import forms, so an outbound
+    # channel can never re-enter the bundle.
+    assert any("forbidden module import" in v for v in scan_text("import urllib.request\n", "u.py"))
+    assert any(
+        "forbidden module import" in v
+        for v in scan_text("from urllib.request import urlopen\n", "u.py")
+    )
+    assert any(
+        "forbidden module import" in v
+        for v in scan_text("def f():\n    import urllib.request\n    return 1\n", "u.py")
+    )
+    for mod in ("urllib", "http", "socket", "ssl"):
+        assert any(
+            "forbidden module import" in v for v in scan_text(f"import {mod}\n", "e.py")
+        ), mod
+
+    # `requests` is SANCTIONED (empirical probe: a bundle importing it was
+    # accepted, HTTP 201; 30+ shipped abilities use it). It must NOT be flagged --
+    # denylisting it would break the requests-based primary transport track.
+    assert scan_text("import requests\n", "r.py") == []
+
+
 def test_linter_flags_from_future_import():
     # The OpenHome loader prepends code at load time, so even a correctly-placed
     # `from __future__ import annotations` ends up after other statements and the

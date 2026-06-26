@@ -378,6 +378,22 @@ bridge は機能上**2 つに割れる**:
 > HTTP pull は DevKit に outbound 通信だけを求め、サーバ責務を完全制御下の PC へ寄せられるため
 > 最も単純かつ確実。ただし上記 ≈（ability の egress 可否）が実機検証の最初の確認項目。
 
+> **訂正・更新（add-capability 実測, Refs #7）**: 上の「HTTP pull は urllib で GET」という当初想定は
+> **一部誤り**だった。add-capability の静的 sandbox は **`urllib` / `http.client` / `socket` を
+> forbidden import で reject**（`urllib` 追加バンドルは HTTP 400）。一方 **`requests` は受理**
+> （inert probe バンドルが HTTP 201、capability_id=6389。公式 doc / 30+ shipped ability も `requests` を
+> sanctioned outbound として使用）。よって:
+> - **HTTP pull の primary 実装は `requests` ベース**（`urllib` ではない）。これが production primary。
+> - **push(scp/sftp) は当初の「sshd 要・受信面増」という短所評価のまま**だが、`requests` egress が
+>   **device で実際に通るか**は socket 層共有のため **実機 GET で初めて確定**（≈要検証）。通らない場合の
+>   **正式 fallback として push を実装済み**（`pc_exporter/push.py`、paramiko SFTP・content-hash 冪等・
+>   backoff・remote atomic swap）。ability 側は **outbound を完全撤去**し storage-only reader に戻したので、
+>   push 経路では bundle に network import が一切無い（sandbox denylist を構造的に回避）。
+> - **push の残 open question（実機調査必要）**: push 先パスが ability の `capability_worker` storage 実体に
+>   一致するか。SDK Reference は storage を役割（"user data storage, shared across abilities"）でしか規定せず
+>   **on-disk パス非公開**、かつ ability は任意パスを低レベルで読めない（sandbox 禁止）。実機で storage 実体
+>   パスを特定して `--target` に与えるのが push fallback の最初の実機ステップ（`deploy/DEPLOY.md` §4.3 B）。
+
 ### M3.4 デプロイ／エージェント作成（実測）
 
 - ability アップロードは REST: `POST app.openhome.com/api/capabilities/add-capability/`
@@ -579,6 +595,9 @@ add-capability は禁止モジュールの **import** を `{"detail":"Forbidden 
 | 観測 / 分類 | module |
 |------|--------|
 | **実測で弾かれた** | `traceback`（エラー文言は `trace`。prefix/独立かは未確定だが両方を denylist） |
+| **実測で弾かれた（network egress, Refs #7）** | `urllib`（追加バンドル HTTP 400）/ `http`(=`http.client`) / `socket`（実機 probe で reject 確認） |
+| network egress（同類として予防 denylist） | `urllib3` `ssl` `ftplib` `telnetlib` `smtplib` |
+| **実測で受理＝sanctioned（denylist しない）** | `requests`（inert probe バンドルが **HTTP 201**, capability_id=6389。公式 doc / 30+ shipped ability が outbound に使用。httpx / aiohttp も同類として許可） |
 | debug / introspection / profiling（同類として denylist） | `trace` `traceback` `pdb` `bdb` `cProfile` `profile` `pstats` `dis` `inspect` `faulthandler` `ctypes` |
 | unsafe serialization | `pickle` `dill` `shelve` `marshal` |
 | platform internal | `redis` `user_config` `connection_manager` |
@@ -590,6 +609,18 @@ add-capability は禁止モジュールの **import** を `{"detail":"Forbidden 
 - 例外詳細のログは `traceback.format_exc()` をやめ **`repr(e)`**（= `"ExceptionType('msg')"`、
   type 名 + message）に変更。`type(e).__name__` は **dunder 属性アクセス（§M3.1-s.1）で別途禁止**
   なので使わない。`repr(e)` は forbidden module も dunder も踏まない。
+- **network egress と push fallback の確定知見（Refs #7）**: 上表の通り `urllib` / `http.client` /
+  `socket` は実測 reject、`requests` は実測 sanctioned（HTTP 201）。よって ability 側は **outbound を
+  完全撤去した storage-only reader** とし、bundle に network import を一切持たせない（denylist を構造的に
+  回避）。production transport は **PC→DevKit の push（`pc_exporter/push.py`, paramiko SFTP）を egress-failure
+  の正式 fallback** として実装済み。`requests` ベースの HTTP pull primary はこの sanctioned 判定に基づく別
+  トラック。詳細・実測根拠は §M3.3.1 の「訂正・更新（add-capability 実測, Refs #7）」を参照。
+- **docstring / コメントも含めた raw-text スキャン**: `deploy/sandbox_lint.py` の regex ルール群は AST では
+  なく **raw source（docstring・コメント込み）** に適用する。SDK Reference が低レベル signal 規則を
+  「docstring/コメント内でも適用」と明記しているため、安全側の posture として **禁止リテラルを bundle 内の
+  全ファイルから排除**する（詳細根拠は bundle 外の本 design.md / DEPLOY.md に置く）。import 系の判定
+  （forbidden module / module-scope json / dunder 属性アクセス）は構造が要るため AST ベース、それ以外は
+  raw-text regex という二段構えで、いずれのスキャナでも通る UNION を強制する。
 - **未知の禁止パターンが残存する可能性**: サーバ sandbox 仕様が非公開のため、別レイヤ（禁止
   module / dunder / 静的パターン）でさらに発見されうる。発見ごとに対応レイヤへ denylist 追加する。
 

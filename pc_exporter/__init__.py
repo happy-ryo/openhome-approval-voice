@@ -12,6 +12,8 @@ deliberately excluded from the add-capability sandbox scanners (it uses sqlite3
 Public surface:
 - core.export_queue / build_queue / atomic_write_json (transport-independent)
 - server.serve / make_server (one-way HTTP delivery of the exported file)
+- push.* (PC -> DevKit scp/sftp delivery; the transport used when the on-device
+  ability cannot make outbound HTTP -- urllib is sandbox-denylisted, M3.3.1)
 """
 from __future__ import annotations
 
@@ -26,6 +28,16 @@ from .core import (
     open_readonly,
     repo_root,
     resolve_db_path,
+)
+from .push import (
+    LocalTransport,
+    PushState,
+    SftpTransport,
+    Target,
+    make_transport,
+    parse_target,
+    push_once,
+    push_with_backoff,
 )
 from .server import DEFAULT_HOST, DEFAULT_PORT, env_port, make_server, serve
 
@@ -45,4 +57,12 @@ __all__ = [
     "env_port",
     "make_server",
     "serve",
+    "LocalTransport",
+    "PushState",
+    "SftpTransport",
+    "Target",
+    "make_transport",
+    "parse_target",
+    "push_once",
+    "push_with_backoff",
 ]
