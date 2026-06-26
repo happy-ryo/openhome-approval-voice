@@ -105,6 +105,11 @@ from approval_voice.renderer import ONE_WAY_SUFFIX  # noqa: E402
 from approval_voice.schema import GATES  # noqa: E402
 from approval_voice.storage import QUEUE_STORE  # noqa: E402
 
+# Prefix of the one-time daemon-startup announcement spoken at watch_queue start
+# (background._speak_startup_announcement). watch_queue prepends it to the spoken
+# list before any seed/pull/readout, so the gate readouts are cw.spoken[1:].
+STARTUP_PREFIX = "approvalvoice デーモンが起動しました"
+
 
 class _FakeCapabilityWorker:
     """In-memory stand-in for the OpenHome storage + speech API (all async)."""
@@ -315,9 +320,11 @@ def test_watch_queue_reads_pushed_storage_no_network(tmp_path):
     _run_watch_queue(watcher)
 
     cw = watcher.capability_worker
-    assert len(cw.spoken) == 5                    # all 5 folded gates read aloud
-    assert all(line.endswith(ONE_WAY_SUFFIX) for line in cw.spoken)
-    assert cw.interrupts == 1                      # interrupt once before the batch
+    assert cw.spoken[0].startswith(STARTUP_PREFIX)  # daemon-startup announcement first
+    gates = cw.spoken[1:]
+    assert len(gates) == 5                         # all 5 folded gates read aloud
+    assert all(line.endswith(ONE_WAY_SUFFIX) for line in gates)
+    assert cw.interrupts == 2                       # startup + the one readout batch
 
 
 def test_watch_queue_self_seeds_when_smoke_autoseed_on(tmp_path, monkeypatch):
@@ -334,5 +341,6 @@ def test_watch_queue_self_seeds_when_smoke_autoseed_on(tmp_path, monkeypatch):
     assert QUEUE_STORE in cw.storage              # self-seeded its own storage
     import json
     assert {i["gate"] for i in json.loads(cw.storage[QUEUE_STORE])} == set(GATES)
-    assert len(cw.spoken) == 4                    # canonical 4-gate sample read aloud
-    assert cw.interrupts == 1
+    assert cw.spoken[0].startswith(STARTUP_PREFIX)  # startup announcement first
+    assert len(cw.spoken[1:]) == 4                # canonical 4-gate sample read aloud
+    assert cw.interrupts == 2                      # startup + the one readout batch
