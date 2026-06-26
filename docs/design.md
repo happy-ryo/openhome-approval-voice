@@ -595,6 +595,9 @@ add-capability は禁止モジュールの **import** を `{"detail":"Forbidden 
 | 観測 / 分類 | module |
 |------|--------|
 | **実測で弾かれた** | `traceback`（エラー文言は `trace`。prefix/独立かは未確定だが両方を denylist） |
+| **実測で弾かれた（network egress, Refs #7）** | `urllib`（追加バンドル HTTP 400）/ `http`(=`http.client`) / `socket`（実機 probe で reject 確認） |
+| network egress（同類として予防 denylist） | `urllib3` `ssl` `ftplib` `telnetlib` `smtplib` |
+| **実測で受理＝sanctioned（denylist しない）** | `requests`（inert probe バンドルが **HTTP 201**, capability_id=6389。公式 doc / 30+ shipped ability が outbound に使用。httpx / aiohttp も同類として許可） |
 | debug / introspection / profiling（同類として denylist） | `trace` `traceback` `pdb` `bdb` `cProfile` `profile` `pstats` `dis` `inspect` `faulthandler` `ctypes` |
 | unsafe serialization | `pickle` `dill` `shelve` `marshal` |
 | platform internal | `redis` `user_config` `connection_manager` |
@@ -606,6 +609,18 @@ add-capability は禁止モジュールの **import** を `{"detail":"Forbidden 
 - 例外詳細のログは `traceback.format_exc()` をやめ **`repr(e)`**（= `"ExceptionType('msg')"`、
   type 名 + message）に変更。`type(e).__name__` は **dunder 属性アクセス（§M3.1-s.1）で別途禁止**
   なので使わない。`repr(e)` は forbidden module も dunder も踏まない。
+- **network egress と push fallback の確定知見（Refs #7）**: 上表の通り `urllib` / `http.client` /
+  `socket` は実測 reject、`requests` は実測 sanctioned（HTTP 201）。よって ability 側は **outbound を
+  完全撤去した storage-only reader** とし、bundle に network import を一切持たせない（denylist を構造的に
+  回避）。production transport は **PC→DevKit の push（`pc_exporter/push.py`, paramiko SFTP）を egress-failure
+  の正式 fallback** として実装済み。`requests` ベースの HTTP pull primary はこの sanctioned 判定に基づく別
+  トラック。詳細・実測根拠は §M3.3.1 の「訂正・更新（add-capability 実測, Refs #7）」を参照。
+- **docstring / コメントも含めた raw-text スキャン**: `deploy/sandbox_lint.py` の regex ルール群は AST では
+  なく **raw source（docstring・コメント込み）** に適用する。SDK Reference が低レベル signal 規則を
+  「docstring/コメント内でも適用」と明記しているため、安全側の posture として **禁止リテラルを bundle 内の
+  全ファイルから排除**する（詳細根拠は bundle 外の本 design.md / DEPLOY.md に置く）。import 系の判定
+  （forbidden module / module-scope json / dunder 属性アクセス）は構造が要るため AST ベース、それ以外は
+  raw-text regex という二段構えで、いずれのスキャナでも通る UNION を強制する。
 - **未知の禁止パターンが残存する可能性**: サーバ sandbox 仕様が非公開のため、別レイヤ（禁止
   module / dunder / 静的パターン）でさらに発見されうる。発見ごとに対応レイヤへ denylist 追加する。
 
