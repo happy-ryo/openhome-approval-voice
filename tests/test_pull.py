@@ -80,6 +80,10 @@ from approval_voice.storage import QUEUE_STORE  # noqa: E402
 
 import json  # noqa: E402
 
+# Prefix of the one-time "pull reached the PC" confirmation utterance
+# (background._speak_pull_confirmation). Match by prefix so the count suffix varies.
+CONFIRM_PREFIX = "PCとの接続に成功しました"
+
 
 # --- fakes (mirror test_push_loopback.py) ---------------------------------
 class _FakeCapabilityWorker:
@@ -211,9 +215,12 @@ def test_pull_writes_fetched_body_and_reads_aloud(monkeypatch):
 
     # The fetched body was persisted verbatim and rendered (4 gates, verbatim).
     assert cw.storage[QUEUE_STORE] == body
-    assert len(cw.spoken) == 4
-    assert all(line.endswith(ONE_WAY_SUFFIX) for line in cw.spoken)
-    assert cw.interrupts == 1
+    # First successful pull also speaks the one-time confirmation, then the gates.
+    assert cw.spoken[0].startswith(CONFIRM_PREFIX)
+    gates_spoken = cw.spoken[1:]
+    assert len(gates_spoken) == 4
+    assert all(line.endswith(ONE_WAY_SUFFIX) for line in gates_spoken)
+    assert cw.interrupts == 2          # confirmation interrupt + readout-batch interrupt
     # GET-only: exactly one call, and it was a GET (one-way, behavioural).
     assert [c[0] for c in fake.calls] == ["get"]
     assert cw.storage  # sanity
@@ -258,6 +265,8 @@ def test_pull_idempotent_skips_rewrite_when_unchanged(monkeypatch):
     assert cw.storage[QUEUE_STORE] == body
     assert cw.writes == 1                      # only the first pull wrote
     assert [c[0] for c in fake.calls] == ["get", "get"]  # both ticks GET, no POST
+    # The confirmation is spoken exactly once even though both pulls succeeded.
+    assert sum(1 for l in cw.spoken if l.startswith(CONFIRM_PREFIX)) == 1
 
 
 def test_pull_non_200_does_not_touch_storage(monkeypatch):
@@ -319,8 +328,9 @@ def test_watch_queue_pull_primary_end_to_end(monkeypatch):
     cw = watcher.capability_worker
     assert cw.storage[QUEUE_STORE] == body         # pulled into storage
     assert {i["gate"] for i in json.loads(cw.storage[QUEUE_STORE])} == set(GATES)
-    assert len(cw.spoken) == 4                      # pulled gates read aloud once
-    assert cw.interrupts == 1
+    assert cw.spoken[0].startswith(CONFIRM_PREFIX)  # confirmation first
+    assert len(cw.spoken[1:]) == 4                   # then the pulled gates, once
+    assert cw.interrupts == 2                         # confirmation + readout batch
     assert [c[0] for c in fake.calls] == ["get"]    # GET only (one-way)
 
 
@@ -340,3 +350,47 @@ def test_watch_queue_pull_disabled_is_storage_only(monkeypatch):
     cw = watcher.capability_worker
     assert fake.calls == []                          # no network when pull disabled
     assert len(cw.spoken) == 4                       # read from pushed storage
+    # The pull confirmation is pull-path only: storage-only mode never speaks it.
+    assert not any(l.startswith(CONFIRM_PREFIX) for l in cw.spoken)
+    assert watcher._pull_confirmed is False
+
+
+def test_first_successful_pull_speaks_confirmation(monkeypatch):
+    # The live-integration proof: on the FIRST successful pull the daemon speaks a
+    # one-time audible confirmation (interrupt + speak) reporting the gate count.
+    body = _sample_body()
+    fake = _FakeRequests(status_code=200, text=body)
+    _install_fake_requests(monkeypatch, fake)
+
+    watcher = _make_watcher()
+    asyncio.run(watcher._pull_into_storage(1))   # pull only, no drain
+    cw = watcher.capability_worker
+
+    assert cw.spoken and cw.spoken[0].startswith(CONFIRM_PREFIX)
+    assert "4件" in cw.spoken[0]                  # reports the pulled gate count
+    assert watcher._pull_confirmed is True
+    assert cw.interrupts == 1                      # confirmation interrupts once
+
+
+def test_failed_pull_does_not_speak_confirmation(monkeypatch):
+    # A failed pull is not a confirmed link -> no confirmation, flag stays armed.
+    fake = _FakeRequests(raise_exc=TimeoutError("connect timed out"))
+    _install_fake_requests(monkeypatch, fake)
+
+    watcher = _make_watcher()
+    asyncio.run(watcher._pull_into_storage(1))
+    cw = watcher.capability_worker
+    assert cw.spoken == []
+    assert watcher._pull_confirmed is False
+
+
+def test_confirmation_fires_even_when_body_empty(monkeypatch):
+    # An empty (but valid) §1.3 queue still confirms the link, reporting 0 gates.
+    fake = _FakeRequests(status_code=200, text="[]")
+    _install_fake_requests(monkeypatch, fake)
+
+    watcher = _make_watcher()
+    asyncio.run(watcher._pull_into_storage(1))
+    cw = watcher.capability_worker
+    assert cw.spoken and cw.spoken[0].startswith(CONFIRM_PREFIX)
+    assert "0件" in cw.spoken[0]
