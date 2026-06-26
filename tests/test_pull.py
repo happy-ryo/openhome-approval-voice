@@ -86,6 +86,10 @@ CONFIRM_PREFIX = "PCとの接続に成功しました"
 # Prefix of the one-time daemon-startup announcement (watch_queue start). It is
 # spoken before any seed/pull/readout, so in a watch_queue run it is cw.spoken[0].
 STARTUP_PREFIX = "approvalvoice デーモンが起動しました"
+# Prefixes of the per-category pull-failure diagnostics (background._announce_pull_failure).
+CONNECT_FAIL_PREFIX = "PCに接続できません"
+HTTP_FAIL_PREFIX = "PCのexporterからHTTP"
+PARSE_FAIL_PREFIX = "PCからの応答形式が想定外です"
 
 
 # --- fakes (mirror test_push_loopback.py) ---------------------------------
@@ -246,7 +250,9 @@ def test_pull_failure_keeps_existing_storage(monkeypatch):
     asyncio.run(scenario())
     cw = watcher.capability_worker
     assert cw.storage[QUEUE_STORE] == body         # prior queue preserved
-    assert len(cw.spoken) == 4                      # still read aloud from fallback
+    # The connect failure is announced first, then the fallback storage is read.
+    assert cw.spoken[0].startswith(CONNECT_FAIL_PREFIX)
+    assert len(cw.spoken[1:]) == 4                   # still read aloud from fallback
 
 
 def test_pull_idempotent_skips_rewrite_when_unchanged(monkeypatch):
@@ -298,7 +304,8 @@ def test_pull_bad_body_not_persisted(monkeypatch):
 
 
 def test_pull_into_empty_storage_when_endpoint_down(monkeypatch):
-    # No prior storage AND pull fails: nothing to read, no crash, no speak.
+    # No prior storage AND pull fails: nothing to READ, but the connect-failure
+    # diagnostic is spoken (and no crash).
     fake = _FakeRequests(raise_exc=ConnectionError("no route to host"))
     _install_fake_requests(monkeypatch, fake)
 
@@ -311,7 +318,8 @@ def test_pull_into_empty_storage_when_endpoint_down(monkeypatch):
     asyncio.run(scenario())
     cw = watcher.capability_worker
     assert QUEUE_STORE not in cw.storage
-    assert cw.spoken == []
+    assert len(cw.spoken) == 1                        # only the connect diagnostic
+    assert cw.spoken[0].startswith(CONNECT_FAIL_PREFIX)
 
 
 def test_watch_queue_pull_primary_end_to_end(monkeypatch):
@@ -380,15 +388,17 @@ def test_first_successful_pull_speaks_confirmation(monkeypatch):
 
 
 def test_failed_pull_does_not_speak_confirmation(monkeypatch):
-    # A failed pull is not a confirmed link -> no confirmation, flag stays armed.
+    # A failed pull is not a confirmed link -> no success confirmation (the flag
+    # stays armed); the connect-failure diagnostic is what speaks instead.
     fake = _FakeRequests(raise_exc=TimeoutError("connect timed out"))
     _install_fake_requests(monkeypatch, fake)
 
     watcher = _make_watcher()
     asyncio.run(watcher._pull_into_storage(1))
     cw = watcher.capability_worker
-    assert cw.spoken == []
+    assert not any(m.startswith(CONFIRM_PREFIX) for m in cw.spoken)  # no success line
     assert watcher._pull_confirmed is False
+    assert cw.spoken[0].startswith(CONNECT_FAIL_PREFIX)             # diagnostic instead
 
 
 def test_confirmation_fires_even_when_body_empty(monkeypatch):
@@ -457,3 +467,84 @@ def test_watch_queue_runs_even_if_startup_speak_fails(monkeypatch):
     assert watcher._startup_announced is True            # flag set despite failure
     assert not any(m.startswith(STARTUP_PREFIX) for m in cw.spoken)  # startup dropped
     assert len(cw.spoken) == 4               # but the gates still read aloud
+
+
+# --- pull-failure diagnostics ---------------------------------------------
+def test_pull_connect_failure_speaks_diagnostic(monkeypatch):
+    # A connectivity failure speaks the 'cannot reach PC' diagnostic once.
+    fake = _FakeRequests(raise_exc=ConnectionError("no route to host"))
+    _install_fake_requests(monkeypatch, fake)
+
+    watcher = _make_watcher()
+    asyncio.run(watcher._pull_into_storage(1))
+    cw = watcher.capability_worker
+    assert len(cw.spoken) == 1
+    assert cw.spoken[0].startswith(CONNECT_FAIL_PREFIX)
+    assert "connect" in watcher._pull_fail_announced
+
+
+def test_pull_connect_failure_silent_on_repeat(monkeypatch):
+    # The same category is announced once per session; later ticks stay silent.
+    fake = _FakeRequests(raise_exc=TimeoutError("connect timed out"))
+    _install_fake_requests(monkeypatch, fake)
+
+    watcher = _make_watcher()
+
+    async def scenario():
+        await watcher._pull_into_storage(1)
+        await watcher._pull_into_storage(2)
+        await watcher._pull_into_storage(3)
+
+    asyncio.run(scenario())
+    cw = watcher.capability_worker
+    # Three failing ticks, but the connect diagnostic is spoken exactly once.
+    assert sum(1 for m in cw.spoken if m.startswith(CONNECT_FAIL_PREFIX)) == 1
+
+
+def test_pull_http_failure_speaks_diagnostic_with_status(monkeypatch):
+    # A non-200 response speaks the HTTP diagnostic once, embedding the status.
+    fake = _FakeRequests(status_code=404, text="not found")
+    _install_fake_requests(monkeypatch, fake)
+
+    watcher = _make_watcher()
+    asyncio.run(watcher._pull_into_storage(1))
+    cw = watcher.capability_worker
+    assert len(cw.spoken) == 1
+    assert cw.spoken[0].startswith(HTTP_FAIL_PREFIX)
+    assert "404" in cw.spoken[0]
+    assert "http" in watcher._pull_fail_announced
+
+
+def test_pull_parse_failure_speaks_diagnostic(monkeypatch):
+    # A 200 with a malformed body speaks the 'unexpected format' diagnostic once.
+    fake = _FakeRequests(status_code=200, text="{ not valid json")
+    _install_fake_requests(monkeypatch, fake)
+
+    watcher = _make_watcher()
+    asyncio.run(watcher._pull_into_storage(1))
+    cw = watcher.capability_worker
+    assert len(cw.spoken) == 1
+    assert cw.spoken[0].startswith(PARSE_FAIL_PREFIX)
+    assert "parse" in watcher._pull_fail_announced
+
+
+def test_pull_failure_diagnostics_independent_of_success(monkeypatch):
+    # A category that failed can later succeed (success confirmation still fires);
+    # the failure flag does not block the success path, and vice versa.
+    fake = _FakeRequests(raise_exc=ConnectionError("down"))
+    _install_fake_requests(monkeypatch, fake)
+    watcher = _make_watcher()
+
+    async def scenario():
+        await watcher._pull_into_storage(1)         # fails -> connect diagnostic
+        # endpoint recovers:
+        fake.raise_exc = None
+        fake.status_code = 200
+        fake.text = _sample_body()
+        await watcher._pull_into_storage(2)         # succeeds -> confirmation
+
+    asyncio.run(scenario())
+    cw = watcher.capability_worker
+    assert any(m.startswith(CONNECT_FAIL_PREFIX) for m in cw.spoken)  # failure spoke
+    assert any(m.startswith(CONFIRM_PREFIX) for m in cw.spoken)       # success spoke
+    assert watcher._pull_confirmed is True

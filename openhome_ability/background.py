@@ -104,6 +104,13 @@ class ApprovalVoiceWatcher(MatchingCapability):
     # three states audible: silence = daemon never loaded; startup line only =
     # daemon up but pull failing; startup + confirmation = live integration.
     _startup_announced: bool = False
+    # Per-category one-shot guard for the pull FAILURE diagnostics. A set of
+    # categories ("connect"/"http"/"parse"/"request") already spoken this session;
+    # each category speaks once then stays quiet (in-memory, re-arms on restart).
+    # Lazily initialized (a mutable class-level default would be shared across
+    # instances). Independent of _pull_confirmed: a category can announce a failure
+    # even after a success, and vice versa — they track different events.
+    _pull_fail_announced: set = None
 
     # Do not change following tag of register capability
     # {{register capability}}
@@ -238,10 +245,19 @@ class ApprovalVoiceWatcher(MatchingCapability):
             # repr(e) avoids a forbidden traceback import / dunder access (§M3.1-s.7).
             self._log("pull tick=%d: GET failed (%s) -> keep existing storage"
                       % (tick, repr(e)))
+            category = self._classify_pull_error(e)
+            if category == "connect":
+                await self._announce_pull_failure(
+                    "connect", "PCに接続できません。ネットワーク経路を確認してください。")
+            else:
+                await self._announce_pull_failure(
+                    "request", "pull で予期しないエラーが発生しました。")
             return
         if status != 200:
             self._log("pull tick=%d: GET status=%d -> keep existing storage"
                       % (tick, status))
+            await self._announce_pull_failure(
+                "http", "PCのexporterからHTTP %d が返りました。" % status)
             return
         # Validate the body parses as the §1.3 shape BEFORE persisting, so a
         # malformed response can never overwrite a good prior queue.
@@ -250,6 +266,8 @@ class ApprovalVoiceWatcher(MatchingCapability):
         except Exception as e:
             self._log("pull tick=%d: body parse failed (%s) -> keep existing storage"
                       % (tick, repr(e)))
+            await self._announce_pull_failure(
+                "parse", "PCからの応答形式が想定外です。")
             return
         # Persist FIRST (the critical approval path). The one-time confirmation
         # below must never be able to drop or delay a fetched queue, so the write
@@ -297,6 +315,50 @@ class ApprovalVoiceWatcher(MatchingCapability):
                   % count)
         await self.capability_worker.send_interrupt_signal()
         await self.capability_worker.speak(text)
+
+    def _classify_pull_error(self, e: Exception) -> str:
+        """Map a pull GET exception to a diagnostic category WITHOUT dunder access.
+
+        Returns "connect" for connectivity failures (the common 'PC not reachable'
+        case — builtin ConnectionError/TimeoutError and, on real hardware, the
+        requests connectivity exceptions), else "request" for any other transport
+        error. `type(e).__name__` is sandbox-forbidden (dunder access), so we
+        classify by isinstance only. The requests.exceptions probe is guarded so a
+        test double (or a missing requests) degrades to the builtin check.
+        """
+        if isinstance(e, (TimeoutError, ConnectionError)):
+            return "connect"
+        try:
+            import requests
+
+            rexc = requests.exceptions
+            if isinstance(e, (rexc.ConnectTimeout, rexc.ConnectionError, rexc.Timeout)):
+                return "connect"
+        except (ImportError, AttributeError):
+            pass
+        return "request"
+
+    async def _announce_pull_failure(self, category: str, message: str) -> None:
+        """Speak a pull-failure diagnostic ONCE per category per session.
+
+        Lets the operator self-diagnose a silent pull loop by ear (the on-device
+        log is invisible — it is the cloud test env). Each category speaks at most
+        once per session (a session restart re-arms it). Independent of the success
+        confirmation. ISOLATED: a speak/interrupt failure here must never break the
+        poll loop, so it is caught and only logged. speak() only — one-way.
+        """
+        if self._pull_fail_announced is None:
+            self._pull_fail_announced = set()
+        if category in self._pull_fail_announced:
+            return
+        self._pull_fail_announced.add(category)
+        self._log("pull fail announce [%s] -> speak" % category)
+        try:
+            await self.capability_worker.send_interrupt_signal()
+            await self.capability_worker.speak(message)
+        except Exception as e:
+            self._log("pull fail announce [%s] speak failed (%s) -> continue"
+                      % (category, repr(e)))
 
     async def _drain_queue_once(self, tick: int) -> None:
         """One read pass: load QUEUE_STORE, speak any unread gates, persist cursor.
