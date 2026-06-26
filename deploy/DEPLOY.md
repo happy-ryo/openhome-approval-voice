@@ -199,32 +199,57 @@ self-seed を止めた本番では、PC 側 exporter が組織の `awaiting_user
 §1.3 キュー JSON を生成して DevKit の daemon の storage（`announce_queue.json`）へ届ける。
 daemon 側は **自 storage を読むだけ**（dedup/render/speak は不変）。届け方は 2 経路:
 
-#### (A) primary: requests HTTP pull（**実装済 — branch feat/openhome-pull-primary**）
+#### (A) primary: requests HTTP pull（**実装済・2026-06-26 live 統合で確定**）
 
 > **経験則で確定（add-capability 実測）**: ability バンドルに `import requests` を入れた
 > capability は **受理された（HTTP 201）**。公式 doc / 30+ の shipped ability も `requests` を
 > sanctioned outbound として使用する。一方 `urllib` / `http.client` / `socket` は
 > **forbidden import で reject**（urllib は HTTP 400）。よって本番 primary は
 > **`requests` ベースの HTTP GET pull**（PC 側 exporter が `py -3 -m pc_exporter serve` で
-> §1.3 を LAN 配信、DevKit が GET）。
+> §1.3 を配信、**cloud 上の ability** が GET）。
+>
+> 🔴 **実行場所の確定（最重要・2026-06-26）**: ability コードは **DevKit ではなく OpenHome の
+> cloud（Ubuntu サーバ）上で実行**される（`docs/design.md` §M3.0。根拠は cloud error log の path
+> `/home/ubuntu/.../user_capabilities/<user_id>/...`）。DevKit は **audio I/O 端末**にすぎない。
+> よって **pull の `requests.get` は cloud から発する** → **private LAN IP（192.168.x.x）は
+> 原理的に不可達**。PULL_URL は **public HTTPS が必須**（採用した経路は §6 の cloudflared
+> quick tunnel）。
+>
+> **egress は確定（≈要検証 → 解消）**: 2026-06-26 の live 統合で **cloud → public HTTPS の
+> GET が成功し real gate を逐語読み上げ**できた（`[ApprovalVoice] pull tick=N: GET 200 ...
+> -> wrote QUEUE_STORE` を確認）。`requests` 受理だけでなく **実 egress も成立**。
 >
 > **実装**: `openhome_ability/background.py` の `_pull_into_storage()` が毎 poll tick で
 > `requests.get(PULL_URL)` し、200 + §1.3 parse 成功時に body を `QUEUE_STORE` へ
 > delete-then-write、その後は不変の read/dedup/render/speak。失敗（endpoint down /
-> 非200 / timeout / bad body）時は storage を触らず既存内容を読む（**fallback chain:
-> pull -> storage -> push**）。設定は `approval_voice/storage.py` の定数
-> `PULL_ENABLED`（既定 True）/ `PULL_URL`（既定 `http://192.168.2.103:8731/announce_queue.json`）/
-> `PULL_TIMEOUT`。**env でなく定数**なのは sandbox が `os` を禁止し device 側が環境変数を
+> 非200 / timeout / bad body）時は storage を触らず既存内容を読む。設定は
+> `approval_voice/storage.py` の定数 `PULL_ENABLED`（既定 True）/ `PULL_URL`（public HTTPS の
+> tunnel URL を埋め込む。例 `https://<random>.trycloudflare.com/announce_queue.json`）/
+> `PULL_TIMEOUT`。**env でなく定数**なのは sandbox が `os` を禁止し ability 側が環境変数を
 > 読めないため（PC 側 exporter は env 可）。GET のみ＝一方向不変（`test_outbound_one_way.py`）。
 >
-> ⚠️ ただし **socket 層は共有**のため、`requests` が受理されても **device 上で実際に egress
-> できるか**は別問題で、**実機 GET で初めて確定**する（≈要検証）。これが実機検証の第 1 項目
-> （`[ApprovalVoice] pull tick=N: GET 200 ... -> wrote QUEUE_STORE` が editor log に出れば egress 成立）。
+> 📎 **historical note（不採用の旧前提）**: 当初は「PC=有線 LAN / DevKit=Wi-Fi が同一 LAN」で
+> **`PULL_URL=http://192.168.2.103:8731/announce_queue.json` の LAN 直配信**を想定していた。
+> これは「ability が DevKit 上で実行される」という誤った前提に基づくもので、**cloud 実行の
+> 判明により無効**（cloud から RFC1918 private IP は不可達）。LAN URL 例は参考記録としてのみ残す。
 
-#### (B) fallback: PC-side push（scp/sftp, 本 PR）
+#### (B) fallback: PC-side push（scp/sftp）
 
-primary の egress が device で**失敗した場合の正式 fallback**（design.md §M3.3.1 の推奨順位
-「HTTP pull > **push(scp)** > 共有マウント > broker」どおり）。**ability 側は一切ネットワーク
+> 🔴 **前提が崩れた（2026-06-26 cloud 実行の判明）**: この push fallback は「ability storage が
+> **DevKit 上**にあり、PC が scp/sftp で DevKit へ届ける」という前提だった。実際は **ability も
+> storage も cloud 側**（`/home/ubuntu/.../user_capabilities/<user_id>/...`, §M3.0）にあり、
+> **PC から DevKit へ push しても cloud の storage には届かない**。よって本 fallback は
+> **現状の本番経路としては無効**（§4.3(B) 末尾の「`--target` が storage 実体に一致するか」という
+> 旧 open question も、cloud 実行の判明で「DevKit パスでは一致しない」と決着）。primary の
+> public HTTPS pull（(A)）が **2026-06-26 に live で確定**したため、当面は (A) に寄せる。
+> 以下の push.py 実装・記述は **transport の参考実装として残置**（local-copy transport や
+> 将来 cloud 側に書き込む別経路が見つかった場合の素材）であり、本番手順ではない。
+
+> 📎 以下は **cloud 実行の判明前**に「primary の egress が device で失敗した場合の fallback」
+> （design.md §M3.3.1 の推奨順位「HTTP pull > push(scp) > 共有マウント > broker」）として設計した
+> ときの記述。**現在は本番経路ではなく参考実装**（上記 🔴 を参照）。当時の設計意図として残す。
+
+当時の設計では push を「**正式 fallback**」と位置づけた。**ability 側は一切ネットワーク
 しない**（urllib を撤去済み・bundle に network import ゼロ）。代わりに **PC が DevKit へキュー
 ファイルを push** し、daemon は従来どおり自 storage を読む。
 
@@ -271,6 +296,12 @@ pull primary 実装（`feat/openhome-pull-primary`）を、既に作成済み・
 済みの capability **6393** へ反映する手順。**新 capability を作り直さず in-place で新バージョン化**する
 （install/enable と personality 紐付けを維持）。
 
+> ⚠️ **§6 の日常運用とは別手順**: §6 Startup Runbook の通り、**tunnel URL を埋め直すたびに
+> `add-capability` で新名（`approvalvoice<N>`）で再アップロード**するのが live で確立した運用
+> （cache 衝突回避のため毎回 install/enable し直す）。本 §4.4 の in-place `edit-capability` は
+> **URL 不変のままバンドル中身だけ差し替えたい**ケース向けの代替で、tunnel URL ローテーションの
+> 日常運用では §6 を使う。
+
 > ⚠️ **認証の差（実測ベース）**: `add-capability` は **X-API-KEY** で通った（HTTP 201, 6393 作成）。
 > 一方 **`edit-capability` / `get-all-capabilities` / `enable/release` は JWT Bearer 必須**の実測報告が
 > ある（先行 worker: X-API-KEY で 401）。**まず X-API-KEY を試し、401 なら**ダッシュボード
@@ -296,15 +327,20 @@ curl -sS -w '\n[HTTP %{http_code}]\n' -X POST "https://app.openhome.com/api/capa
 
 ### 4.5 live 統合の確証（pull 版・real awaiting_user gate）
 
-1. **PC**: `py -3 -m pc_exporter serve --db-path <claude-org>/.state/state.db` が live state.db を
-   `http://192.168.2.103:8731/announce_queue.json` で配信中（FW 8731 inbound 解放済）。
+1. **PC**: `py -3 -m pc_exporter serve --db-path <claude-org>/.state/state.db --since <起動時刻のUTC ...Z> --port 80`
+   が live state.db を `http://localhost:80/announce_queue.json` で配信中。これを **cloudflared
+   quick tunnel で public HTTPS 公開**（§6.2）し、発行された `https://<random>.trycloudflare.com`
+   を `PULL_URL` に埋めて ability をビルド・再アップロード（§6.3）。`--since` で歴代 `notify_sent`
+   を切り捨てる（§6.1）。
 2. **real gate を 1 件 emit**（組織側、例）: `awaiting_user` イベントを state.db に記録 → exporter が即時公開。
-3. **DevKit**: 山彦のセッションを（再）開始 → daemon 起動 → 毎 tick `requests.get` で pull。
-4. **確証ログ**（"Open In Editor" → log タブ）:
-   - `[ApprovalVoice] watch_queue: task started (... PULL_ENABLED=True ...)`
-   - `[ApprovalVoice] pull tick=1: GET 200 (Nchars, M items) -> wrote QUEUE_STORE`  ← **egress 成立**
-   - `[ApprovalVoice] poll tick=1: ... fresh=M` → `read_aloud: speak ...`（**non-SMOKE な real gate を逐語**）
-   - `pull tick=N: GET failed/status=...` が出るなら egress 不可 → push fallback（§4.3 B）へ。
+3. **DevKit セッション再起動**: 山彦のセッションを（再）開始 → **cloud 上の daemon** 起動 →
+   毎 tick `requests.get(PULL_URL)` で pull。
+4. **確証**（音声＋ログ。ログは "Open In Editor" → log タブだが **cloud test env の表示**なので
+   実機到達は**音声**で確認する。§5.6）:
+   - 音声: 「approvalvoice デーモンが起動しました。…」→「PCとの接続に成功しました。N件…」が聞こえる＝**egress 成立**。
+   - ログ: `[ApprovalVoice] pull tick=1: GET 200 (Nchars, M items) -> wrote QUEUE_STORE`。
+   - 続けて `poll tick: ... fresh=M` → `read_aloud: speak ...`（**non-SMOKE な real gate を逐語**）。
+   - 失敗音声（§5.6 の 6 状態）が出るなら原因切り分けへ。
 
 ---
 
@@ -405,19 +441,141 @@ OpenHome DevKit OS 依存のため実機で確認**。公式 doc に明記なし
 > 注: 上記の厚いログは M3.1 実機 bring-up 用の診断 instrumentation。読み上げ確認後は
 > `background.py` の `_log` 呼び出しを間引いてよい（`[ApprovalVoice]` prefix で grep 可能）。
 
+### 5.6 TTS 6 状態の切り分け（聞こえる発話 → 原因）
+
+ability は **cloud 上で実行**されるため、Dashboard の editor log は **OpenHome の cloud test env**
+の出力で、**実機（あなたの DevKit）の到達状況とは別物**。よって実機の状態は **DevKit から
+聞こえる発話そのもの**で切り分けるのが一次情報になる（PR #17/#18/#19 で実装した self-diagnostics
+発話）。聞こえる音声を上から照合する:
+
+| 聞こえる発話 | 状態 | 原因 / 次の手 |
+|---|---|---|
+| **完全無音**（起動発話すら出ない） | daemon 未起動、または audio 出力不通 | capability が agent に **install + enable** 済みか・**セッションを開始したか**を確認。他 ability の通常会話で音が出るなら audio device は健全（§5.5.1） |
+| **「approvalvoice デーモンが起動しました。PC との接続を確認中です。」のみ** | daemon は起動したが pull がまだ成功も明確な失敗もしていない | 初回 tick 待ち（最大 `POLL_SECONDS`≒15s）。それでも続くなら次のいずれかの失敗発話が出るまで待つ／PULL_URL・tunnel・exporter を確認 |
+| 起動発話 ＋ **「PCとの接続に成功しました。N件の通知が取得できました。」** | **正常**（pull egress 成立・取得成功） | 続けて real gate を逐語読み上げ。これが live 統合の確証 |
+| 起動発話 ＋ **「PCに接続できません。ネットワーク経路を確認してください。」** | **接続失敗**（timeout / 接続拒否 / 名前解決失敗 = connect カテゴリ） | tunnel が起動中か（§6.2）、`PULL_URL` が**現在の** trycloudflare URL と一致するか（再起動で変わる §6.3）、exporter `serve` 稼働中か |
+| 起動発話 ＋ **「PCのexporterからHTTP N が返りました。」** | **非200**（TCP/TLS は到達したが 404/500 等） | tunnel は通っている。URL の path（`/announce_queue.json`）と exporter の serve 状態を確認 |
+| 起動発話 ＋ **「PCからの応答形式が想定外です。」** | **200 だが §1.3 JSON として parse 失敗** | exporter が正しい queue JSON を配信しているか。tunnel が HTML エラーページ（502 等）を本文返ししていないか |
+
+> ℹ️ 上記以外に、connect 以外の予期しない transport エラーでは
+> **「pull で予期しないエラーが発生しました。」**（request カテゴリ）が出る。発話は各カテゴリ
+> **セッション中 1 回だけ**（再 arm はセッション再起動）で、ログを見られない実機での到達確認を
+> 音声で代替するためのもの。
+
 ---
 
-## 6. 既知の「要検証」（スモークの障害にしない）
+## 6. Startup Runbook（日常運用）
 
-- **本番（live org state → 端末 storage）の配送**: storage-name モデルでは ability は
-  自分の `capability_worker` storage しか読めない。PC 上で発生する live `awaiting_user`
-  state をその storage へどう届けるかは 2 経路（§4.3）: **(A) primary = requests HTTP pull**
-  （ability が `requests` で GET → `write_file`。`requests` は add-capability で受理＝実測 201）、
-  **(B) fallback = PC-side push**（PC が scp/sftp で storage へ配送、ability は読むだけ＝本 PR）。
-  残る ≈要検証は順に: ① **device 上で実際に egress できるか**（socket 層共有のため実機 GET で確定。
-  失敗なら (B) push へ）、② **push の `--target` が ability storage 実体に一致するか**（SDK は
-  storage を役割でしか規定せず on-disk パス非公開＝**実機調査必要**、§4.3 (B) の open question）。
-  self-seed スモーク（`SMOKE_AUTOSEED=True`）は egress / 配送非依存で端末内完結するため、配送検証前
+cloud 実行 + cloudflared quick tunnel 構成での**毎回の起動手順**。tunnel URL は cloudflared
+プロセス停止で消え、**再起動のたびに変わる**ため、URL が変わるたびに ability を再ビルド・
+再アップロードする「URL 更新サイクル」が日常運用のペインになる。以下を順に回す。
+
+### 6.1 PC exporter を起動（`--since` で歴代キューを切り捨て）
+
+```bash
+# state.db は append-only で notify_sent イベントが累積する。--since を付けないと、
+# 再 install のたびに歴代キュー全件が再読みされ全部読み上げられてしまう。起動時刻の
+# UTC ISO8601(...Z) を渡し、それ以降に発生した gate だけを公開する。
+py -3 -m pc_exporter serve \
+    --db-path <claude-org>/.state/state.db \
+    --since 2026-06-26T00:00:00.000Z \
+    --port 80
+# → "serving ... on http://0.0.0.0:80/announce_queue.json (re-export 2.0s)"
+```
+
+> ⚠️ **`--since` は `occurred_at` と同じ UTC `...Z` 形式で渡す**。フィルタは
+> `occurred_at >= ?` の **辞書順（文字列）比較**で、DB の `occurred_at` は UTC + `Z` 接尾辞
+> （例 `2026-06-26T01:00:00.000Z`）で格納される。**ローカル時刻（例 JST）の文字列を渡すと
+> UTC 値より先行**し、新しく emit された gate が「UTC が追いつくまで」除外される事故になる。
+> 必ず **UTC で現在時刻**を生成し、`occurred_at` と**同じ小数秒つき `...sssZ` 形**にする
+> （例 PowerShell: `(Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")`、
+> bash: `date -u +%Y-%m-%dT%H:%M:%S.000Z`）。秒精度どまり（`...ssZ`）だと、辞書順比較で
+> `.`(0x2E) が `Z`(0x5A) より小さいため **同じ秒に格納された小数秒つきイベント
+> （`...00.500Z`）が `...00Z` 未満と判定されて落ちる**。小数秒は `.000Z` で十分（その秒の
+> イベントを取りこぼさない安全側）。リテラル `now` は不可（ISO8601 文字列のみ）。
+> 省略すると**全歴代**が対象になる（first-run replay を招く）。`--port 80` は cloudflared を
+> `http://localhost:80` に向ける都合（§6.2）。
+
+### 6.2 cloudflared quick tunnel を起動（public HTTPS 発行）
+
+```bash
+# 初回のみ: scoop で cloudflared を導入
+scoop install cloudflared
+
+# quick tunnel を起動（アカウント不要）。localhost:80 を public HTTPS で露出する
+cloudflared tunnel --url http://localhost:80
+# → 標準出力に https://<random>.trycloudflare.com が発行される（これを控える）
+```
+
+> ℹ️ **quick URL は揮発的**: cloudflared プロセスを止めると URL は消え、**再起動のたびに別の
+> ランダム URL** になる。永続 URL が欲しい場合は Cloudflare アカウントで **named tunnel** という
+> 別オプションがある（本書はスコープ外。概要のみ）。
+
+### 6.3 PULL_URL を更新して ability を再ビルド・再アップロード
+
+新 tunnel URL が出るたびに以下を回す（**cache 衝突回避のため毎回新名でアップロード**）:
+
+```bash
+# (a) PULL_URL を新 tunnel URL に書き換え（approval_voice/storage.py の定数 1 行）
+#     PULL_URL = "https://<random>.trycloudflare.com/announce_queue.json"
+
+# (b) 新名（approvalvoice<N>）でラップして zip 化（N は毎回インクリメント）
+py -3 deploy/build_zip.py --root-folder approvalvoice<N> --out dist/approval-voice-ability.zip
+
+# (c) add-capability で新名アップロード（同名だと cache 衝突するため毎回 name を変える）
+curl -sS -X POST "https://app.openhome.com/api/capabilities/add-capability/" \
+  -H "X-API-KEY: $OPENHOME_API_KEY" \
+  -F "name=approvalvoice<N>" -F "category=background_daemon" \
+  -F "description=Secretary の承認待ちを逐語で読み上げる一方向 ability" \
+  -F "trigger_words=承認読み上げ, approval voice" \
+  -F "zip_file=@dist/approval-voice-ability.zip"
+
+# (d) ★先に旧 capability（approvalvoice<N-1>）を disable / uninstall してから、
+#     対象 agent（山彦）へ approvalvoice<N> を install + enable
+# (e) DevKit セッションを再起動（= daemon 再起動。cloud 側 ability が新 PULL_URL で起動）
+```
+
+> 🔴 **旧 daemon を必ず止める（二重起動防止）**: 各 enable 済み capability は
+> **background_daemon** で、`PULL_URL` は**ビルド時にバンドルへ焼き込まれる**。新名で
+> `approvalvoice<N>` を enable しても **`approvalvoice<N-1>` を disable しない限り旧 daemon が
+> 生き残り**、**古い（死んだ/別の）PULL_URL** を poll し続ける → 起動/失敗発話の重複、旧
+> endpoint がまだ生きていれば**二重読み上げ**になる。よって **(d) は「旧名を disable/uninstall
+> → 新名を install/enable」の順**で行う。ダッシュボードで対象 agent の capability 一覧から
+> `approvalvoice<N-1>` を無効化（または取り外し）すること。
+
+> ℹ️ `--root-folder` のラップ名（パッケージ名）は相対 import に対して名前非依存なので、
+> `approvalvoice<N>` のように毎回変えても import は壊れない（`docs/design.md` §M3.1-sandbox）。
+> URL 不変でバンドルだけ差し替えたい場合の in-place 更新は §4.4 を参照。
+
+### 6.4 セッション再起動チェックリスト
+
+- [ ] `pc_exporter serve` が **新しい `--since`**（今回の起動時刻）で稼働している。
+- [ ] `cloudflared tunnel --url http://localhost:80` が稼働し、**新 URL を控えた**。
+- [ ] `approval_voice/storage.py` の `PULL_URL` が**その新 URL**に一致している。
+- [ ] `build_zip.py --root-folder approvalvoice<N>` で **N をインクリメント**して再ビルドした。
+- [ ] **旧 capability（`approvalvoice<N-1>`）を disable / uninstall した**（二重 daemon 防止）。
+- [ ] `add-capability` を**新名**でアップロードし、agent に install + enable した。
+- [ ] DevKit セッションを再起動し、**「PCとの接続に成功しました。」が聞こえる**（§5.6）。
+      （起動/失敗発話や読み上げが**重複**するなら旧 daemon が残存＝旧名 disable 漏れを疑う）
+
+---
+
+## 7. 既知の「要検証」（スモークの障害にしない）
+
+- **本番（live org state → ability storage）の配送 — 2026-06-26 に primary が確定**:
+  storage-name モデルでは ability は自分の `capability_worker` storage しか読めない。PC 上で
+  発生する live `awaiting_user` state をその storage へどう届けるかは **(A) primary = requests
+  HTTP pull**（**cloud 上の** ability が `requests` で public HTTPS を GET → `write_file`）で
+  **決着**: 2026-06-26 の live 統合で **cloud → cloudflared tunnel の GET egress が成立**し
+  real gate を逐語読み上げできた（旧 ≈要検証①「device 上で egress できるか」は、実行場所が
+  DevKit ではなく **cloud** と判明した上で **egress 成立を実測**＝**解消**）。
+- **解消済みだった旧 open question**: ② **push の `--target` が ability storage 実体に一致するか**
+  は、storage が **cloud 側**にあると判明したため「**PC からの DevKit パス push では一致しない**」と
+  決着（§4.3(B)）。push fallback は本番経路としては無効・参考実装として残置。
+- **残る要検証 / 運用上の注意**: ① **quick tunnel URL の揮発性**（再起動毎に変わる → §6 の URL
+  更新サイクルが必要。永続化は named tunnel で別途）。② cloud test env の editor log は実機到達と
+  別物なので、実機確認は §5.6 の**発話**で行う。
+- self-seed スモーク（`SMOKE_AUTOSEED=True`）は egress / 配送非依存で端末内完結するため、配送検証前
   でも読み上げ経路の導通は確認できる。
 
 ---
