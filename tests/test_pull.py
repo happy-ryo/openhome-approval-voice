@@ -87,6 +87,7 @@ class _FakeCapabilityWorker:
         self.storage = {}
         self.spoken = []
         self.interrupts = 0
+        self.writes = 0  # count write_file calls (to assert idempotent skip)
 
     async def check_if_file_exists(self, name, temp):
         return name in self.storage
@@ -96,6 +97,7 @@ class _FakeCapabilityWorker:
 
     async def write_file(self, name, text, temp):
         self.storage[name] = text
+        self.writes += 1
 
     async def delete_file(self, name, temp):
         self.storage.pop(name, None)
@@ -235,6 +237,27 @@ def test_pull_failure_keeps_existing_storage(monkeypatch):
     cw = watcher.capability_worker
     assert cw.storage[QUEUE_STORE] == body         # prior queue preserved
     assert len(cw.spoken) == 4                      # still read aloud from fallback
+
+
+def test_pull_idempotent_skips_rewrite_when_unchanged(monkeypatch):
+    # The steady state is an unchanged queue re-served every tick. The second
+    # identical pull must NOT rewrite storage (write amplification guard); the
+    # seen-cursor, not a rewrite, prevents double-speak.
+    body = _sample_body()
+    fake = _FakeRequests(status_code=200, text=body)
+    _install_fake_requests(monkeypatch, fake)
+
+    watcher = _make_watcher()
+
+    async def scenario():
+        await watcher._pull_into_storage(1)   # first: writes
+        await watcher._pull_into_storage(2)   # second: identical -> skip write
+
+    asyncio.run(scenario())
+    cw = watcher.capability_worker
+    assert cw.storage[QUEUE_STORE] == body
+    assert cw.writes == 1                      # only the first pull wrote
+    assert [c[0] for c in fake.calls] == ["get", "get"]  # both ticks GET, no POST
 
 
 def test_pull_non_200_does_not_touch_storage(monkeypatch):

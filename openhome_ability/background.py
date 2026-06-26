@@ -176,14 +176,36 @@ class ApprovalVoiceWatcher(MatchingCapability):
             self._log("read_aloud: speak %d/%d done" % (i, len(fresh)))
         self._log("read_aloud: end")
 
+    def _fetch_queue(self):
+        """Blocking GET of the live queue; returns ``(status_code, text)``.
+
+        SYNCHRONOUS on purpose: it is invoked via ``asyncio.to_thread`` (see
+        _pull_into_storage) so the blocking `requests` call runs on a worker thread
+        and never stalls the agent's shared asyncio event loop (which also drives
+        voice/TTS). This matches the shipped openhome-dev/abilities `package-tracker`
+        ability, whose blocking `requests` helpers are run via `asyncio.to_thread`.
+        `requests` is imported here (method-local) so module load / build_zip import
+        verify need no network dependency installed. Raises on transport failure;
+        the async caller catches it. GET only — no write-back (one-way invariant).
+        """
+        import requests
+
+        resp = requests.get(PULL_URL, timeout=PULL_TIMEOUT)
+        return resp.status_code, resp.text
+
     async def _pull_into_storage(self, tick: int) -> None:
         """PRIMARY transport: GET the live queue from the PC exporter into storage.
 
-        design.md §M3.3.1 (A): a read-only `requests.get(PULL_URL)` against the PC
-        exporter's LAN endpoint. On HTTP 200 with a parseable §1.3 body, the body
-        is written verbatim into the daemon's own QUEUE_STORE (delete-then-write,
-        the documented pattern that avoids the append-mode corruption); the
-        unchanged _drain_queue_once pass below then renders/speaks it.
+        design.md §M3.3.1 (A): a read-only GET of the PC exporter's LAN endpoint
+        (PULL_URL), run off-loop via ``asyncio.to_thread(self._fetch_queue)``. On
+        HTTP 200 with a parseable §1.3 body the body is written into the daemon's
+        own QUEUE_STORE; the unchanged _drain_queue_once pass then renders/speaks it.
+
+        Idempotent: if the fetched bytes equal what QUEUE_STORE already holds, the
+        write is skipped (the steady state is an unchanged queue re-served every
+        tick; rewriting it ~4x/min would amplify SD-card writes for nothing — the
+        push transport engineers the same content-idempotency). The seen-cursor,
+        not this, is what prevents double-speak.
 
         On ANY failure (endpoint down, non-200, timeout, unparseable body) this
         logs and returns WITHOUT touching storage, so the daemon falls back to
@@ -196,25 +218,22 @@ class ApprovalVoiceWatcher(MatchingCapability):
         that this stays a GET (it bans post/put/patch and a GET handed `data=`).
         """
         # method-local imports: a module-scope encode import (json) is sandbox-
-        # banned; `requests` is the sanctioned outbound client (§M3.1-s.7) and is
-        # imported here too so module load (and build_zip's import verify) needs no
-        # network dependency installed — only a live pull tick touches it.
+        # banned. `asyncio.to_thread` is NOT denylisted (only asyncio.sleep/
+        # create_task are) and is the shipped off-loop pattern for blocking I/O.
+        import asyncio
         import json
 
-        import requests
-
         try:
-            resp = requests.get(PULL_URL, timeout=PULL_TIMEOUT)
+            status, raw = await asyncio.to_thread(self._fetch_queue)
         except Exception as e:
             # repr(e) avoids a forbidden traceback import / dunder access (§M3.1-s.7).
             self._log("pull tick=%d: GET failed (%s) -> keep existing storage"
                       % (tick, repr(e)))
             return
-        if resp.status_code != 200:
+        if status != 200:
             self._log("pull tick=%d: GET status=%d -> keep existing storage"
-                      % (tick, resp.status_code))
+                      % (tick, status))
             return
-        raw = resp.text
         # Validate the body parses as the §1.3 shape BEFORE persisting, so a
         # malformed response can never overwrite a good prior queue.
         try:
@@ -224,6 +243,14 @@ class ApprovalVoiceWatcher(MatchingCapability):
                       % (tick, repr(e)))
             return
         if await self.capability_worker.check_if_file_exists(QUEUE_STORE, False):
+            current = await self.capability_worker.read_file(QUEUE_STORE, False)
+            if current == raw:
+                if tick <= 3:
+                    self._log("pull tick=%d: GET 200 unchanged (%dchars) -> skip write"
+                              % (tick, len(raw)))
+                return
+            # delete-then-write: the documented pattern that avoids append-mode
+            # corruption on an existing storage file.
             await self.capability_worker.delete_file(QUEUE_STORE, False)
         await self.capability_worker.write_file(QUEUE_STORE, raw, False)
         if tick <= 3:
