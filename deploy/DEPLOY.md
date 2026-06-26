@@ -526,9 +526,18 @@ curl -sS -X POST "https://app.openhome.com/api/capabilities/add-capability/" \
   -F "trigger_words=承認読み上げ, approval voice" \
   -F "zip_file=@dist/approval-voice-ability.zip"
 
-# (d) ダッシュボードで対象 agent（山彦）へ install + enable
+# (d) ★先に旧 capability（approvalvoice<N-1>）を disable / uninstall してから、
+#     対象 agent（山彦）へ approvalvoice<N> を install + enable
 # (e) DevKit セッションを再起動（= daemon 再起動。cloud 側 ability が新 PULL_URL で起動）
 ```
+
+> 🔴 **旧 daemon を必ず止める（二重起動防止）**: 各 enable 済み capability は
+> **background_daemon** で、`PULL_URL` は**ビルド時にバンドルへ焼き込まれる**。新名で
+> `approvalvoice<N>` を enable しても **`approvalvoice<N-1>` を disable しない限り旧 daemon が
+> 生き残り**、**古い（死んだ/別の）PULL_URL** を poll し続ける → 起動/失敗発話の重複、旧
+> endpoint がまだ生きていれば**二重読み上げ**になる。よって **(d) は「旧名を disable/uninstall
+> → 新名を install/enable」の順**で行う。ダッシュボードで対象 agent の capability 一覧から
+> `approvalvoice<N-1>` を無効化（または取り外し）すること。
 
 > ℹ️ `--root-folder` のラップ名（パッケージ名）は相対 import に対して名前非依存なので、
 > `approvalvoice<N>` のように毎回変えても import は壊れない（`docs/design.md` §M3.1-sandbox）。
@@ -540,8 +549,10 @@ curl -sS -X POST "https://app.openhome.com/api/capabilities/add-capability/" \
 - [ ] `cloudflared tunnel --url http://localhost:80` が稼働し、**新 URL を控えた**。
 - [ ] `approval_voice/storage.py` の `PULL_URL` が**その新 URL**に一致している。
 - [ ] `build_zip.py --root-folder approvalvoice<N>` で **N をインクリメント**して再ビルドした。
+- [ ] **旧 capability（`approvalvoice<N-1>`）を disable / uninstall した**（二重 daemon 防止）。
 - [ ] `add-capability` を**新名**でアップロードし、agent に install + enable した。
 - [ ] DevKit セッションを再起動し、**「PCとの接続に成功しました。」が聞こえる**（§5.6）。
+      （起動/失敗発話や読み上げが**重複**するなら旧 daemon が残存＝旧名 disable 漏れを疑う）
 
 ---
 
