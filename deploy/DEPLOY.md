@@ -265,6 +265,47 @@ py -3 -m pc_exporter push \
 > requests pull（primary）へ寄せる。本 PR の push.py は **transport のみ**を提供し、`--target` が
 > 指す場所へファイルを確実に届けるところまでを保証する。
 
+### 4.4 既存 capability を pull 版へ更新する（capability_id=6393 想定）
+
+pull primary 実装（`feat/openhome-pull-primary`）を、既に作成済み・山彦(590628)へ install/enable
+済みの capability **6393** へ反映する手順。**新 capability を作り直さず in-place で新バージョン化**する
+（install/enable と personality 紐付けを維持）。
+
+> ⚠️ **認証の差（実測ベース）**: `add-capability` は **X-API-KEY** で通った（HTTP 201, 6393 作成）。
+> 一方 **`edit-capability` / `get-all-capabilities` / `enable/release` は JWT Bearer 必須**の実測報告が
+> ある（先行 worker: X-API-KEY で 401）。**まず X-API-KEY を試し、401 なら**ダッシュボード
+> （app.openhome.com）DevTools → Network の `Authorization: Bearer <token>`（短命）を inline で使う。
+> worker は外部 POST 不可（classifier）なので、以下は **user/窓口が `!` 経由で実行**する。
+
+```bash
+# zip は本 worktree の dist/approval-voice-ability.zip（pull 版で再ビルド済）。
+export AUTH='Authorization: Bearer <DevToolsのBearer>'   # 401 時。X-API-KEY 可ならそちらでも可
+ZIP=/c/Users/iwama/Documents/work/org/workers/openhome-approval-voice/.worktrees/openhome-push-transport/dist/approval-voice-ability.zip
+
+# STEP U: 新バージョン作成（非破壊 PUT）。成功=HTTP 200。400=sandbox 新ルール（本文 token を sandbox_lint へ）
+curl -sS -w '\n[HTTP %{http_code}]\n' -X PUT "https://app.openhome.com/api/capabilities/edit-capability/6393/" \
+  -H "$AUTH" -F "name=approvalvoice" -F "category=background_daemon" -F "zip_file=@${ZIP}"
+
+# STEP V: 反映確認。6393 の capability_versions で id 最大(最新版)の is_user_enabled を見る
+curl -sS "https://app.openhome.com/api/capabilities/get-all-capabilities/" -H "$AUTH"
+
+# STEP W: 最新版が is_user_enabled=false のときだけ（version 単位 enable, body 不要）
+curl -sS -w '\n[HTTP %{http_code}]\n' -X POST "https://app.openhome.com/api/capabilities/enable/release/<最新version_id>/" -H "$AUTH"
+# 404/405 なら代替: PUT edit-installed-capability/6393/ -F "enabled=true" -F "category=background_daemon"
+```
+
+### 4.5 live 統合の確証（pull 版・real awaiting_user gate）
+
+1. **PC**: `py -3 -m pc_exporter serve --db-path <claude-org>/.state/state.db` が live state.db を
+   `http://192.168.2.103:8731/announce_queue.json` で配信中（FW 8731 inbound 解放済）。
+2. **real gate を 1 件 emit**（組織側、例）: `awaiting_user` イベントを state.db に記録 → exporter が即時公開。
+3. **DevKit**: 山彦のセッションを（再）開始 → daemon 起動 → 毎 tick `requests.get` で pull。
+4. **確証ログ**（"Open In Editor" → log タブ）:
+   - `[ApprovalVoice] watch_queue: task started (... PULL_ENABLED=True ...)`
+   - `[ApprovalVoice] pull tick=1: GET 200 (Nchars, M items) -> wrote QUEUE_STORE`  ← **egress 成立**
+   - `[ApprovalVoice] poll tick=1: ... fresh=M` → `read_aloud: speak ...`（**non-SMOKE な real gate を逐語**）
+   - `pull tick=N: GET failed/status=...` が出るなら egress 不可 → push fallback（§4.3 B）へ。
+
 ---
 
 ## 5. DevKit 実機チェックリスト
